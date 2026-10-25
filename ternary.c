@@ -229,3 +229,89 @@ void tern_gemv(const tern_mat *m, const float *x, float *y) {
     }
     if (xq != stackbuf) free(xq);
 }
+
+/* ------------------------------------------------------------- q8 int8 */
+
+int q8_mat_init(q8_mat *m, int nrows, int ncols) {
+    memset(m, 0, sizeof(*m));
+    m->nrows = nrows;
+    m->ncols = ncols;
+    m->q = (int8_t *)calloc((size_t)nrows * ncols, 1);
+    m->scale = (float *)calloc((size_t)nrows, sizeof(float));
+    if (!m->q || !m->scale) { q8_mat_free(m); return -1; }
+    for (int r = 0; r < nrows; r++) m->scale[r] = 1.0f;
+    return 0;
+}
+
+void q8_mat_free(q8_mat *m) {
+    if (!m) return;
+    free(m->q); free(m->scale);
+    memset(m, 0, sizeof(*m));
+}
+
+void q8_quantize_mat(q8_mat *m, const float *w) {
+    for (int r = 0; r < m->nrows; r++) {
+        const float *wr = w + (size_t)r * m->ncols;
+        float amax = 0.0f;
+        for (int i = 0; i < m->ncols; i++) {
+            float a = fabsf(wr[i]);
+            if (a > amax) amax = a;
+        }
+        float s = amax / 127.0f;
+        if (s < 1e-8f) s = 1e-8f;
+        m->scale[r] = s;
+        int8_t *qr = m->q + (size_t)r * m->ncols;
+        for (int i = 0; i < m->ncols; i++) {
+            float v = roundf(wr[i] / s);
+            if (v > 127.0f) v = 127.0f;
+            if (v < -127.0f) v = -127.0f;
+            qr[i] = (int8_t)v;
+        }
+    }
+}
+
+static int32_t q8_dot_i8(const int8_t *w, const int8_t *x, int n) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    int32x4_t acc = vdupq_n_s32(0);
+    int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        acc = vdotq_s32(acc, vld1q_s8(w + i),      vld1q_s8(x + i));
+        acc = vdotq_s32(acc, vld1q_s8(w + i + 16), vld1q_s8(x + i + 16));
+        acc = vdotq_s32(acc, vld1q_s8(w + i + 32), vld1q_s8(x + i + 32));
+        acc = vdotq_s32(acc, vld1q_s8(w + i + 48), vld1q_s8(x + i + 48));
+    }
+    int32_t r = vaddvq_s32(acc);
+    for (; i < n; i++) r += (int32_t)w[i] * (int32_t)x[i];
+    return r;
+#else
+    int32_t r = 0;
+    for (int i = 0; i < n; i++) r += (int32_t)w[i] * (int32_t)x[i];
+    return r;
+#endif
+}
+
+void q8_gemv(const q8_mat *m, const float *x, float *y) {
+    int n = m->ncols;
+    float xmax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(x[i]);
+        if (a > xmax) xmax = a;
+    }
+    float xs = xmax / 127.0f;
+    if (xs < 1e-12f) xs = 1e-12f;
+    int8_t stackbuf[SPEL_MAX_DFF];
+    int8_t *xq = stackbuf;
+    if (n > SPEL_MAX_DFF) xq = (int8_t *)malloc((size_t)n);
+    if (!xq) return;
+    for (int i = 0; i < n; i++) {
+        float v = roundf(x[i] / xs);
+        if (v > 127.0f) v = 127.0f;
+        if (v < -127.0f) v = -127.0f;
+        xq[i] = (int8_t)v;
+    }
+    for (int r = 0; r < m->nrows; r++) {
+        int32_t acc = q8_dot_i8(m->q + (size_t)r * n, xq, n);
+        y[r] = (float)acc * m->scale[r] * xs;
+    }
+    if (xq != stackbuf) free(xq);
+}

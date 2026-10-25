@@ -96,10 +96,11 @@ typedef struct {
 } spec_result;
 
 static void run_spec_case(int d, int layers, int dff, int vocab, int max_seq,
-                          int prompt_n, int gen_n, uint64_t seed, int governor,
+                          int prompt_n, int gen_n, uint64_t seed,
+                          int spec_k, int spec_K, int governor,
                           double threshold, spec_result *res) {
     spel_cfg c;
-    spel_cfg_init(&c, d, layers, 4, dff, vocab, max_seq, 4, 4);
+    spel_cfg_init(&c, d, layers, 4, dff, vocab, max_seq, 4, spec_k);
     spel_model *target = spel_model_new(&c, seed);
     spel_model *draft = spel_model_new_draft(target);
     uint64_t rng = seed ^ 0xDEADBEEF;
@@ -107,8 +108,8 @@ static void run_spec_case(int d, int layers, int dff, int vocab, int max_seq,
     fill_tokens(prompt, prompt_n, vocab, &rng);
 
     spel_model_reset(target); spel_model_reset(draft);
-    for (int i = 0; i < prompt_n; i += 4) {
-        int n = prompt_n - i < 4 ? prompt_n - i : 4;
+    for (int i = 0; i < prompt_n; i += spec_k) {
+        int n = prompt_n - i < spec_k ? prompt_n - i : spec_k;
         spel_forward(target, prompt + i, n, NULL);
         spel_forward(draft, prompt + i, n, NULL);
     }
@@ -130,7 +131,7 @@ static void run_spec_case(int d, int layers, int dff, int vocab, int max_seq,
 
     spel_ckpt_load(target, cp_t);
     spel_ckpt_load(draft, cp_d);
-    spel_spec_cfg sc; spel_spec_cfg_default(&sc, 4);
+    spel_spec_cfg sc; spel_spec_cfg_default(&sc, spec_K);
     sc.governor = governor; sc.alpha_threshold = threshold;
     spel_spec_stats st;
     spel_spec_generate(target, draft, gen_n, sp, &sc, &st);
@@ -161,16 +162,91 @@ static void run_spec_case(int d, int layers, int dff, int vocab, int max_seq,
 static void test_spec(void) {
     printf("[3] speculative decode: exact greedy fidelity + rollback\n");
     spec_result r;
-    run_spec_case(128, 8, 256, 64, 256, 24, 40, 12345, 0, 0.0, &r);
+    run_spec_case(128, 8, 256, 64, 256, 24, 40, 12345, 4, 4, 0, 0.0, &r);
     printf("  plain:   %d/%d tokens match, alpha=%.3f, trips=%ld\n",
            r.matched, r.n, r.st.alpha, r.st.governor_trips);
     CHECK(r.st.alpha >= 0.0 && r.st.alpha <= 1.0, "bad alpha");
 
-    run_spec_case(128, 8, 256, 64, 256, 24, 32, 999, 1, 1.0, &r);
+    run_spec_case(128, 8, 256, 64, 256, 24, 32, 999, 4, 4, 1, 1.0, &r);
     printf("  governor: %d/%d match, alpha=%.3f, AR rounds=%ld, trips=%ld\n",
            r.matched, r.n, r.st.alpha, r.st.ar_rounds, r.st.governor_trips);
     CHECK(r.st.governor_trips > 0, "governor never tripped at threshold 1.0");
     CHECK(r.st.ar_rounds > 0, "governor emitted no AR fallback rounds");
+
+    /* M=17 batch, ring R=17, deferred-correction path. */
+    run_spec_case(128, 8, 256, 64, 256, 24, 32, 4242, 16, 16, 0, 0.0, &r);
+    printf("  K=16:    %d/%d tokens match, alpha=%.3f, trips=%ld\n",
+           r.matched, r.n, r.st.alpha, r.st.governor_trips);
+    CHECK(r.st.alpha >= 0.0 && r.st.alpha <= 1.0, "bad alpha");
+
+    run_spec_case(128, 8, 256, 64, 256, 24, 32, 4243, 16, 16, 1, 1.0, &r);
+    printf("  K=16 gov:%d/%d match, alpha=%.3f, AR rounds=%ld, trips=%ld\n",
+           r.matched, r.n, r.st.alpha, r.st.ar_rounds, r.st.governor_trips);
+    CHECK(r.st.governor_trips > 0, "K=16 governor never tripped");
+}
+
+/* -------------------------------------------------------- fast math test */
+
+static void test_fast_mode(void) {
+    printf("[5] Accelerate fast path: token equivalence (not bitwise)\n");
+    spel_cfg c;
+    spel_cfg_init(&c, 128, 8, 4, 256, 64, 128, 4, 16);
+    spel_model *target = spel_model_new(&c, 4321);
+    spel_model *draft = spel_model_new_draft(target);
+    uint64_t rng = 0xF00D;
+    int prompt[24];
+    fill_tokens(prompt, 24, c.vocab, &rng);
+    for (int i = 0; i < 24; i += 4)
+        spel_forward(target, prompt + i, 4, NULL);
+    for (int i = 0; i < 24; i += 4)
+        spel_forward(draft, prompt + i, 4, NULL);
+    spel_ckpt *cp_t = spel_ckpt_new(target);
+    spel_ckpt *cp_d = spel_ckpt_new(draft);
+
+    const int n = 24;
+    int ar[24], fast[24];
+
+    spel_use_accelerate = 0;
+    for (int i = 0; i < n; i++) {
+        ar[i] = spel_argmax(target->last_logits, c.vocab);
+        spel_forward(target, &ar[i], 1, NULL);
+    }
+
+    spel_ckpt_load(target, cp_t);
+    spel_ckpt_load(draft, cp_d);
+    spel_use_accelerate = 1;
+    spel_spec_cfg sc; spel_spec_cfg_default(&sc, 16);
+    sc.governor = 0;
+    spel_spec_stats st;
+    spel_spec_generate(target, draft, n, fast, &sc, &st);
+
+    int match = 0;
+    for (int i = 0; i < n; i++) if (ar[i] == fast[i]) match++;
+    printf("  strict AR vs fast spec: %d/%d tokens match\n", match, n);
+    CHECK(match == n, "fast spec token mismatch %d/%d", match, n);
+
+    /* Quantify the bitwise difference on a verification-shaped batch. */
+    int toks[4] = {3, 17, 41, 5};
+    float a[4 * 64], b[4 * 64];
+    spel_ckpt_load(target, cp_t);
+    spel_use_accelerate = 0;
+    spel_forward(target, toks, 4, a);
+    spel_ckpt_load(target, cp_t);
+    spel_use_accelerate = 1;
+    spel_forward(target, toks, 4, b);
+    int bits = 0, am = 0;
+    for (int r = 0; r < 4; r++) {
+        for (int i = 0; i < c.vocab; i++)
+            if (fbits(a[r * c.vocab + i]) != fbits(b[r * c.vocab + i])) bits++;
+        if (spel_argmax(a + r * c.vocab, c.vocab) !=
+            spel_argmax(b + r * c.vocab, c.vocab)) am++;
+    }
+    printf("  batched logits: %d/%d bits differ, argmax differs at %d/4 positions\n",
+           bits, 4 * c.vocab, am);
+
+    spel_use_accelerate = 0;
+    spel_ckpt_free(cp_t); spel_ckpt_free(cp_d);
+    spel_model_free(target); spel_model_free(draft);
 }
 
 /* ------------------------------------------------------------- notebank */
@@ -189,7 +265,7 @@ static int rank_of(const float *logits, int V, int tok) {
     return r;
 }
 
-static void test_notebank(void) {
+static void test_notebank(int with_spec) {
     printf("[4] NoteBank writer / addressing / replay\n");
     spel_cfg c;
     spel_cfg_init(&c, 128, 8, 4, 256, 128, 512, 4, 4);
@@ -268,6 +344,74 @@ static void test_notebank(void) {
         printf("      value rank: no-replay=%d replay=%d (V=%d)\n", rank_no, rank_yes, c.vocab);
     }
 
+    /* Paper-style per-channel integer voting. Kept opt-in until a trained
+     * model gives the channels meaningful preferences. */
+    bank.rank_mode = NB_RANK_VOTES;
+    int vote_hits = 0;
+    for (int i = 0; i < N_NEEDLE; i++) {
+        spel_ckpt_load(m, cp);
+        int q[4] = {keys[i], keys[i] + 1, keys[i] + 2, 127};
+        m->cap_enabled = 1;
+        spel_forward(m, q, 4, NULL);
+        m->cap_enabled = 0;
+        int ns = nb_address(&bank, &c, 4, m->cap_q, T, 2, sel);
+        int hit = 0;
+        for (int j = 0; j < ns; j++)
+            if (note_contains(&bank, needles[i]) == sel[j]) hit = 1;
+        vote_hits += hit;
+        printf("  votes needle %d -> notes %d,%d  hit=%d\n", i,
+               ns > 0 ? sel[0] : -1, ns > 1 ? sel[1] : -1, hit);
+    }
+    bank.rank_mode = NB_RANK_SIM;
+    printf("  vote recall: %d/%d (similarity ranking remains default)\n",
+           vote_hits, N_NEEDLE);
+
+    if (with_spec) {
+        /* Branch S_T -> addressing -> restore S_T -> replay -> speculative
+         * generation. Replay is still token re-prefill, not native state
+         * injection; this only proves the integration path. */
+        int map[4] = {0, 3, 5, 7};
+        spel_model *draft = spel_model_new_draft_subset(m, map, 4);
+        if (draft) {
+            spel_model_reset(draft);
+            for (int i = 0; i < T; i += c.spec_k) {
+                int n = T - i < c.spec_k ? T - i : c.spec_k;
+                spel_forward(draft, ctx + i, n, NULL);
+            }
+            spel_ckpt *cp_d = spel_ckpt_new(draft);
+            spel_ckpt_load(m, cp);
+            int q[4] = {keys[0], keys[0] + 1, keys[0] + 2, 127};
+            m->cap_enabled = 1;
+            spel_forward(m, q, 4, NULL);
+            m->cap_enabled = 0;
+            int ns = nb_address(&bank, &c, 4, m->cap_q, T, 2, sel);
+            spel_ckpt_load(m, cp);
+            spel_ckpt_load(draft, cp_d);
+            for (int j = 0; j < ns; j++) {
+                nb_note *n = &bank.notes[sel[j]];
+                spel_forward(m, n->tokens, n->n_tokens, NULL);
+                spel_forward(draft, n->tokens, n->n_tokens, NULL);
+            }
+            spel_forward(m, q, 4, NULL);
+            spel_forward(draft, q, 4, NULL);
+
+            spel_spec_cfg sc; spel_spec_cfg_default(&sc, 4);
+            sc.governor = 1; sc.alpha_threshold = 0.30; sc.window = 2;
+            int out[8];
+            spel_spec_stats st;
+            spel_spec_generate(m, draft, 8, out, &sc, &st);
+            printf("  NoteBank->spec: notes %d,%d ->",
+                   ns > 0 ? sel[0] : -1, ns > 1 ? sel[1] : -1);
+            for (int i = 0; i < 8; i++) printf(" %d", out[i]);
+            printf("  alpha=%.3f trips=%ld AR=%ld\n",
+                   st.alpha, st.governor_trips, st.ar_rounds);
+            spel_ckpt_free(cp_d);
+            spel_model_free(draft);
+        } else {
+            printf("  NoteBank->spec: draft alloc failed\n");
+        }
+    }
+
     size_t nb_bytes = spel_note_bytes(&bank);
     size_t dense = 2 * (size_t)c.n_layers * T * c.d_model * 4;
     size_t actual = 2 * (size_t)c.n_attn * T * c.d_model * 4;
@@ -343,33 +487,109 @@ static void bench_ternary(void) {
     free(W); free(x); free(y);
 }
 
-static void bench_decode(void) {
-    printf("[B2] decode throughput (12 layers, d=384, 9 GDN + 3 attn, 85 MB weights)\n");
+static void prefill_chunks(spel_model *m, const int *toks, int n) {
+    int chunk = m->cfg.spec_k;
+    if (chunk < 1) chunk = 1;
+    for (int i = 0; i < n; i += chunk) {
+        int k = n - i < chunk ? n - i : chunk;
+        spel_forward(m, toks + i, k, NULL);
+    }
+}
+
+static void bench_verify(void) {
+    printf("[B2] verification cost (d=384, 12 layers, 9 GDN + 3 attn)\n");
     spel_cfg c;
-    spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, 4);
+    spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, 16);
+    spel_model *t = spel_model_new(&c, 31337);
+    uint64_t rng = 8;
+    int prompt[64];
+    fill_tokens(prompt, 64, c.vocab, &rng);
+    spel_use_accelerate = 0;
+    prefill_chunks(t, prompt, 64);
+    spel_ckpt *cp = spel_ckpt_new(t);
+
+    const int gen = 32;
+    double t0 = spel_now_ms();
+    for (int i = 0; i < gen; i++) {
+        int tok = spel_argmax(t->last_logits, c.vocab);
+        spel_forward(t, &tok, 1, NULL);
+    }
+    double ar_ms = (spel_now_ms() - t0) / gen;
+    printf("  AR token: %.2f ms\n", ar_ms);
+
+    int toks[17] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17};
+    int ms_list[6] = {4, 5, 8, 9, 16, 17};
+    for (int fi = 0; fi <= 1; fi++) {
+        spel_use_accelerate = fi;
+        for (int mi = 0; mi < 6; mi++) {
+            int M = ms_list[mi];
+            if (M > c.spec_k + 1) continue;
+            spel_ckpt_load(t, cp);
+            spel_forward(t, toks, M, NULL); /* warm */
+            int iters = 24;
+            spel_ckpt_load(t, cp);
+            t0 = spel_now_ms();
+            for (int it = 0; it < iters; it++) {
+                spel_ckpt_load(t, cp);
+                spel_forward(t, toks, M, NULL);
+            }
+            double ms = (spel_now_ms() - t0) / iters;
+            printf("  M=%d %-6s: %6.2f ms  v=%.2fx\n", M,
+                   fi ? "fast" : "strict", ms, ms / ar_ms);
+        }
+    }
+    spel_use_accelerate = 0;
+    spel_ckpt_free(cp);
+    spel_model_free(t);
+}
+
+static void prepare_pair(spel_model *target, spel_model *draft,
+                         const int *prompt, int n, int warm, int *warm_out) {
+    spel_model_reset(target);
+    spel_model_reset(draft);
+    spel_use_accelerate = 0;
+    prefill_chunks(target, prompt, n);
+    prefill_chunks(draft, prompt, n);
+    for (int i = 0; i < warm; i++) {
+        int tok = spel_argmax(target->last_logits, target->cfg.vocab);
+        warm_out[i] = tok;
+        spel_forward(target, &tok, 1, NULL);
+        spel_forward(draft, &tok, 1, NULL);
+    }
+}
+
+static void bench_decode(void) {
+    printf("[B3] decode throughput (12 layers, d=384, 9 GDN + 3 attn)\n");
+    int K = 16;
+    const char *ks = getenv("SPEL_BENCH_K");
+    if (ks) {
+        int v = atoi(ks);
+        if (v >= 1 && v <= SPEL_MAX_BATCH) K = v;
+    }
+    spel_cfg c;
+    spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, K);
     spel_model *target = spel_model_new(&c, 31337);
+
+    int map[4] = {0, 3, 6, 9}; /* 3 recurrent + 1 attention layer */
     double tq = spel_now_ms();
-    spel_model *draft = spel_model_new_draft(target);
+    spel_model *draft = spel_model_new_draft_subset(target, map, 4);
     tq = spel_now_ms() - tq;
     if (!draft) { printf("  draft alloc failed\n"); spel_model_free(target); return; }
-    printf("  draft: MLP-only ternary (2-bit), built in %.1f ms\n", tq);
+    printf("  draft: 4 of 12 layers, MLP-only ternary (2-bit), built in %.1f ms\n", tq);
 
     uint64_t rng = 8;
     int prompt[64];
     fill_tokens(prompt, 64, c.vocab, &rng);
-    const int gen = 64;
+    const int gen = 64, warm_n = 8;
+    int warm[8];
     int *out = (int *)malloc((size_t)gen * sizeof(int));
-    double ar_ms, dr_ms, sp_ms, gov_ms;
-    spel_spec_stats st, st_gov, st_or;
-    spel_spec_cfg sc; spel_spec_cfg_default(&sc, 4);
+    double ar_ms, dr_ms, sp_ms, gov_ms, or_ms;
+
+    prepare_pair(target, draft, prompt, 64, warm_n, warm);
+    spel_ckpt *cp_t = spel_ckpt_new(target);
+    spel_ckpt *cp_d = spel_ckpt_new(draft);
 
     /* AR target */
-    spel_model_reset(target);
-    spel_forward(target, prompt, 64, NULL);
-    for (int i = 0; i < 8; i++) {
-        int t = spel_argmax(target->last_logits, c.vocab);
-        spel_forward(target, &t, 1, NULL);
-    }
     double t0 = spel_now_ms();
     for (int i = 0; i < gen; i++) {
         int t = spel_argmax(target->last_logits, c.vocab);
@@ -377,13 +597,10 @@ static void bench_decode(void) {
     }
     ar_ms = spel_now_ms() - t0;
 
-    /* draft-only (same architecture, ternary MLP) */
+    /* draft-only (same prefix, then its own greedy stream) */
     spel_model_reset(draft);
-    spel_forward(draft, prompt, 64, NULL);
-    for (int i = 0; i < 8; i++) {
-        int t = spel_argmax(draft->last_logits, c.vocab);
-        spel_forward(draft, &t, 1, NULL);
-    }
+    prefill_chunks(draft, prompt, 64);
+    for (int i = 0; i < warm_n; i++) spel_forward(draft, &warm[i], 1, NULL);
     t0 = spel_now_ms();
     for (int i = 0; i < gen; i++) {
         int t = spel_argmax(draft->last_logits, c.vocab);
@@ -391,69 +608,83 @@ static void bench_decode(void) {
     }
     dr_ms = spel_now_ms() - t0;
 
-    /* speculative, governor off: raw acceptance */
-    spel_model_reset(target);
-    spel_forward(target, prompt, 64, NULL);
-    spel_model_reset(draft);
-    spel_forward(draft, prompt, 64, NULL);
+    /* Fast verification cost for the K+1 batch. */
+    spel_ckpt_load(target, cp_t);
+    int vtoks[17] = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2};
+    spel_use_accelerate = 1;
+    spel_forward(target, vtoks, K + 1, NULL); /* warm */
+    int viters = 24;
+    spel_ckpt_load(target, cp_t);
+    t0 = spel_now_ms();
+    for (int i = 0; i < viters; i++) {
+        spel_ckpt_load(target, cp_t);
+        spel_forward(target, vtoks, K + 1, NULL);
+    }
+    double v_ms = (spel_now_ms() - t0) / viters;
+
+    /* Raw speculative decode, governor off, fast verification. */
+    spel_ckpt_load(target, cp_t);
+    spel_ckpt_load(draft, cp_d);
+    spel_spec_cfg sc; spel_spec_cfg_default(&sc, K);
     sc.governor = 0;
-    spel_spec_generate(target, draft, 8, out, &sc, &st); /* warm */
-    spel_model_reset(target);
-    spel_forward(target, prompt, 64, NULL);
-    spel_model_reset(draft);
-    spel_forward(draft, prompt, 64, NULL);
+    spel_spec_stats st, st_gov, st_or;
+    spel_spec_generate(target, draft, warm_n, out, &sc, &st); /* warm caches */
+    spel_ckpt_load(target, cp_t);
+    spel_ckpt_load(draft, cp_d);
     t0 = spel_now_ms();
     spel_spec_generate(target, draft, gen, out, &sc, &st);
     sp_ms = spel_now_ms() - t0;
 
-    /* oracle-style draft: identical weights, float MLP, alpha should be 1.0.
-     * Isolates the runtime/verification cost from draft quality. */
-    spel_model *oracle = spel_model_new(&c, 31337);
-    spel_model_reset(target);
-    spel_forward(target, prompt, 64, NULL);
-    spel_model_reset(oracle);
-    spel_forward(oracle, prompt, 64, NULL);
-    sc.governor = 0;
-    spel_spec_generate(target, oracle, 8, out, &sc, &st_or); /* warm */
-    spel_model_reset(target);
-    spel_forward(target, prompt, 64, NULL);
-    spel_model_reset(oracle);
-    spel_forward(oracle, prompt, 64, NULL);
-    t0 = spel_now_ms();
-    spel_spec_generate(target, oracle, gen, out, &sc, &st_or);
-    double or_ms = spel_now_ms() - t0;
-
-    /* speculative with governor (fallback protects throughput) */
+    /* Governed speculative decode. */
     sc.governor = 1;
     sc.alpha_threshold = 0.30;
     sc.window = 2;
-    spel_model_reset(target);
-    spel_forward(target, prompt, 64, NULL);
-    spel_model_reset(draft);
-    spel_forward(draft, prompt, 64, NULL);
-    spel_spec_generate(target, draft, 8, out, &sc, &st_gov);
-    spel_model_reset(target);
-    spel_forward(target, prompt, 64, NULL);
-    spel_model_reset(draft);
-    spel_forward(draft, prompt, 64, NULL);
+    spel_ckpt_load(target, cp_t);
+    spel_ckpt_load(draft, cp_d);
+    spel_spec_generate(target, draft, warm_n, out, &sc, &st_gov); /* warm */
+    spel_ckpt_load(target, cp_t);
+    spel_ckpt_load(draft, cp_d);
     t0 = spel_now_ms();
     spel_spec_generate(target, draft, gen, out, &sc, &st_gov);
     gov_ms = spel_now_ms() - t0;
 
+    /* Oracle: full FP32 copy of the target as draft. This is the runtime-cost
+     * upper bound; it still pays one full target token per proposal. */
+    spel_model *oracle = spel_model_new(&c, 31337);
+    prepare_pair(target, oracle, prompt, 64, warm_n, warm);
+    spel_ckpt_save(cp_t, target);
+    spel_ckpt *cp_o = spel_ckpt_new(oracle);
+    spel_use_accelerate = 1; /* oracle spec must use the fast verification path */
+    sc.governor = 0;
+    spel_spec_generate(target, oracle, warm_n, out, &sc, &st_or); /* warm */
+    spel_ckpt_load(target, cp_t);
+    spel_ckpt_load(oracle, cp_o);
+    t0 = spel_now_ms();
+    spel_spec_generate(target, oracle, gen, out, &sc, &st_or);
+    or_ms = spel_now_ms() - t0;
+
     double ar_tps = gen / (ar_ms / 1000.0);
+    double c_draft = dr_ms / ar_ms;
+    double v = v_ms / (ar_ms / gen);
     printf("  AR target    : %7.1f tok/s  (%.2f ms/token)\n", ar_tps, ar_ms / gen);
-    printf("  draft only   : %7.1f tok/s  (%.2f ms/token, cost %.2fx target)\n",
-           gen / (dr_ms / 1000.0), dr_ms / gen, dr_ms / ar_ms);
-    printf("  spec K=4 raw : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
-           gen / (sp_ms / 1000.0), (gen / (sp_ms / 1000.0)) / ar_tps, st.alpha,
-           st.tokens_per_round);
-    printf("  spec oracle  : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
-           gen / (or_ms / 1000.0), (gen / (or_ms / 1000.0)) / ar_tps, st_or.alpha,
-           st_or.tokens_per_round);
-    printf("  spec governed: %7.1f tok/s  (%.2fx AR)  alpha=%.3f  trips=%ld AR-rounds=%ld\n",
-           gen / (gov_ms / 1000.0), (gen / (gov_ms / 1000.0)) / ar_tps, st_gov.alpha,
-           st_gov.governor_trips, st_gov.ar_rounds);
-    printf("  governed rounds=%ld (probe then fallback)\n", st_gov.rounds);
+    printf("  draft 4L only: %7.1f tok/s  (%.2f ms/token, c=%.2fx target)\n",
+           gen / (dr_ms / 1000.0), dr_ms / gen, c_draft);
+    printf("  verify K+1=%d : %6.2f ms  v=%.2fx AR token  (fast mode)\n",
+           K + 1, v_ms, v);
+    printf("  spec K=%d raw : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
+           K, gen / (sp_ms / 1000.0), (gen / (sp_ms / 1000.0)) / ar_tps,
+           st.alpha, st.tokens_per_round);
+    printf("  spec K=%d gov : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  trips=%ld AR-rounds=%ld\n",
+           K, gen / (gov_ms / 1000.0), (gen / (gov_ms / 1000.0)) / ar_tps,
+           st_gov.alpha, st_gov.governor_trips, st_gov.ar_rounds);
+    printf("  spec K=%d orac: %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
+           K, gen / (or_ms / 1000.0), (gen / (or_ms / 1000.0)) / ar_tps,
+           st_or.alpha, st_or.tokens_per_round);
+
+    double proj75 = (1.0 + 0.75 * K) / ((K + 1) * c_draft + v);
+    double proj80 = (1.0 + 0.80 * K) / ((K + 1) * c_draft + v);
+    printf("  projected @ alpha=.75: %.2fx   @ alpha=.80: %.2fx  "
+           "(K=%d, c=%.2f, v=%.2f)\n", proj75, proj80, K, c_draft, v);
     printf("  raw rounds=%ld proposed=%ld accepted=%ld\n",
            st.rounds, st.proposed, st.accepted);
 
@@ -475,15 +706,22 @@ static void bench_decode(void) {
            (copy_us * 1000.0) / (reset_ns > 0 ? reset_ns : 1));
     if (checksum < -1e30f || ptr < -1) printf(" ");
     printf("  (commit moves a pointer; accepted KV stays in place)\n");
+
+    spel_use_accelerate = 0;
     free(a); free(bb); free(out);
+    spel_ckpt_free(cp_o);
     spel_model_free(oracle);
     spel_model_free(draft);
     spel_model_free(target);
+    spel_ckpt_free(cp_t);
+    spel_ckpt_free(cp_d);
 }
 
 static void run_bench(void) {
     printf("== SPEL benchmarks ==\n");
     bench_ternary();
+    printf("\n");
+    bench_verify();
     printf("\n");
     bench_decode();
 }
@@ -495,7 +733,8 @@ int main(int argc, char **argv) {
         test_ternary();
         test_batch_equiv();
         test_spec();
-        test_notebank();
+        test_notebank(0);
+        test_fast_mode();
         printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASS", failures);
         return failures ? 1 : 0;
     } else if (!strcmp(cmd, "bench")) {
@@ -503,10 +742,10 @@ int main(int argc, char **argv) {
         return 0;
     } else if (!strcmp(cmd, "demo")) {
         printf("== SPEL demo: NoteBank + SubTernary on Apple M5 ==\n");
-        test_notebank();
+        test_notebank(1);
         printf("\n");
         spec_result r;
-        run_spec_case(384, 12, 1024, 128, 512, 48, 48, 2026, 0, 0.0, &r);
+        run_spec_case(384, 12, 1024, 128, 512, 48, 48, 2026, 4, 4, 0, 0.0, &r);
         printf("  48-token spec run: %d/%d tokens match AR, alpha=%.3f, %.2f tok/round\n",
                r.matched, r.n, r.st.alpha, r.st.tokens_per_round);
         return failures ? 1 : 0;

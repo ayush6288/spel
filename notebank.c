@@ -30,6 +30,7 @@ void nb_bank_init(nb_bank *b, const spel_cfg *cfg, int chunk, int window,
     b->budget = budget;
     b->per_chunk = per_chunk;
     b->addr_dim = addr_dim;
+    b->rank_mode = NB_RANK_SIM;
     b->n_channels = cfg->n_channels;
     b->dh = cfg->head_dim;
     b->seed = seed ? seed : 0xC0FFEEULL;
@@ -207,15 +208,22 @@ int nb_address(const nb_bank *b, const spel_cfg *cfg, int Q, const float *cap_q,
         votes[arg]++;
         for (int i = 0; i < b->n_notes; i++) score[i] += best[i];
     }
-    /* Rank by summed channel similarity. The paper's integer channel vote is
-     * kept as a diagnostic; with an untrained model the magnitudes are much
-     * more discriminative than win counts. */
+    /* Rank by summed channel similarity (default) or by per-channel integer
+     * votes (paper Algorithm 1). Votes use summed similarity, then smaller
+     * index, as the tie-break so the result is deterministic. */
     int n = R < b->n_notes ? R : b->n_notes;
     for (int r = 0; r < n; r++) {
         int arg = -1;
         for (int i = 0; i < b->n_notes; i++) {
             if (score[i] <= -1e29f) continue;
-            if (arg < 0 || score[i] > score[arg]) arg = i;
+            if (arg < 0) { arg = i; continue; }
+            if (b->rank_mode == NB_RANK_VOTES) {
+                if (votes[i] > votes[arg] ||
+                    (votes[i] == votes[arg] && score[i] > score[arg]))
+                    arg = i;
+            } else if (score[i] > score[arg]) {
+                arg = i;
+            }
         }
         sel[r] = arg;
         if (arg >= 0) score[arg] = -1e30f;

@@ -1,7 +1,7 @@
 CC      ?= clang
 ARCH    ?= -mcpu=apple-m5
 CFLAGS  ?= -O3 $(ARCH) -ffast-math -std=gnu11 -Wall -Wextra
-LDFLAGS ?= -lm
+LDFLAGS ?= -lm -framework Accelerate
 
 SRC = main.c model.c ternary.c notebank.c
 BIN = spel

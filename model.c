@@ -9,6 +9,15 @@
 #include <arm_neon.h>
 #include <time.h>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+/* cblas_sgemm is marked deprecated in the macOS 13.3+ SDK; the replacement
+ * ILP64 interface is not needed for these int-sized GEMMs. */
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+int spel_use_accelerate = 0;
+
 /* ---------------------------------------------------------------- rng */
 
 uint64_t spel_rng_next(uint64_t *s) {
@@ -86,9 +95,19 @@ static inline float dotf(const float *a, const float *b, int n) {
     return s;
 }
 
-/* out[M][N] = x[M][K] * W[N][K]^T.  W is streamed once for all rows. */
+/* out[M][N] = x[M][K] * W[N][K]^T.  W is streamed once for all rows.
+ * Strict mode keeps the explicit dot-product order used by AR, which is what
+ * makes batched verification bit-identical. Fast mode routes M>1 through
+ * Accelerate/AMX and is token-equivalent, not bit-identical. */
 static void matmul_rows(float *out, const float *x, const float *W,
                         int M, int N, int K) {
+#if defined(__APPLE__)
+    if (spel_use_accelerate && M > 1) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    M, N, K, 1.0f, x, K, W, K, 0.0f, out, N);
+        return;
+    }
+#endif
     for (int n = 0; n < N; n++) {
         const float *w = W + (size_t)n * K;
         for (int r = 0; r < M; r++)
@@ -153,7 +172,7 @@ static void alloc_runtime(spel_model *m) {
             m->xh[l] = (float *)calloc((size_t)SPEL_XH_RING * d, sizeof(float));
         }
     }
-    size_t bf = (size_t)c->spec_k * (8 * (size_t)d + 3 * (size_t)c->d_ff) + 64;
+    size_t bf = (size_t)(c->spec_k + 1) * (8 * (size_t)d + 3 * (size_t)c->d_ff) + 64;
     m->buf_floats = bf;
     m->buf = (float *)calloc(bf, sizeof(float));
     m->last_logits = (float *)calloc((size_t)c->vocab, sizeof(float));
@@ -228,30 +247,62 @@ spel_model *spel_model_new(const spel_cfg *cfg, uint64_t seed) {
     return m;
 }
 
-spel_model *spel_model_new_draft(const spel_model *t) {
+spel_model *spel_model_new_draft_subset(const spel_model *t,
+                                        const int *layer_map, int n_layers) {
+    if (!t || !layer_map || n_layers <= 0 ||
+        n_layers > t->cfg.n_layers || n_layers > SPEL_MAX_LAYERS)
+        return NULL;
     spel_model *m = (spel_model *)calloc(1, sizeof(*m));
     if (!m) return NULL;
     m->cfg = t->cfg;
+    m->cfg.n_layers = n_layers;
+    m->cfg.n_linear = m->cfg.n_attn = 0;
+    for (int l = 0; l < n_layers; l++) {
+        int src = layer_map[l];
+        if (src < 0 || src >= t->cfg.n_layers) { free(m); return NULL; }
+        m->layer[l] = t->layer[src];
+        int is_attn = !t->cfg.is_linear[src];
+        m->cfg.is_linear[l] = !is_attn;
+        m->cfg.lin_index[l] = is_attn ? -1 : m->cfg.n_linear++;
+        m->cfg.attn_index[l] = is_attn ? m->cfg.n_attn++ : -1;
+    }
+    m->cfg.n_channels = m->cfg.n_linear * m->cfg.n_heads;
     m->owns_params = 0;
     m->emb = t->emb; m->wout = t->wout; m->normf = t->normf;
     m->rope_cos = t->rope_cos; m->rope_sin = t->rope_sin;
-    memcpy(m->layer, t->layer, sizeof(t->layer));
     m->is_ternary = 1;
     m->rng = t->rng ^ 0xA5A5A5A55A5A5A5AULL;
     alloc_runtime(m);
     if (!m->buf || !m->last_logits) { spel_model_free(m); return NULL; }
     const spel_cfg *c = &m->cfg;
-    for (int l = 0; l < c->n_layers; l++) {
+    for (int l = 0; l < n_layers; l++) {
+        int src = layer_map[l];
         spel_layer *L = &m->layer[l];
-        if (tern_mat_init(&L->t1, c->d_ff, c->d_model)) return NULL;
-        if (tern_mat_init(&L->t3, c->d_ff, c->d_model)) return NULL;
-        if (tern_mat_init(&L->t2, c->d_model, c->d_ff)) return NULL;
-        tern_quantize_mat(&L->t1, t->layer[l].w1);
-        tern_quantize_mat(&L->t3, t->layer[l].w3);
-        tern_quantize_mat(&L->t2, t->layer[l].w2);
+        if (tern_mat_init(&L->t1, c->d_ff, c->d_model) ||
+            tern_mat_init(&L->t3, c->d_ff, c->d_model) ||
+            tern_mat_init(&L->t2, c->d_model, c->d_ff)) {
+            spel_model_free(m);
+            return NULL;
+        }
+        tern_quantize_mat(&L->t1, t->layer[src].w1);
+        tern_quantize_mat(&L->t3, t->layer[src].w3);
+        tern_quantize_mat(&L->t2, t->layer[src].w2);
+        if (q8_mat_init(&L->q_wqkv, 3 * c->d_model, c->d_model) ||
+            q8_mat_init(&L->q_wo, c->d_model, c->d_model)) {
+            spel_model_free(m);
+            return NULL;
+        }
+        q8_quantize_mat(&L->q_wqkv, t->layer[src].wqkv);
+        q8_quantize_mat(&L->q_wo, t->layer[src].wo);
     }
     m->pos = 0;
     return m;
+}
+
+spel_model *spel_model_new_draft(const spel_model *t) {
+    int map[SPEL_MAX_LAYERS];
+    for (int i = 0; i < t->cfg.n_layers; i++) map[i] = i;
+    return spel_model_new_draft_subset(t, map, t->cfg.n_layers);
 }
 
 void spel_model_free(spel_model *m) {
@@ -262,6 +313,8 @@ void spel_model_free(spel_model *m) {
         tern_mat_free(&m->layer[l].t1);
         tern_mat_free(&m->layer[l].t3);
         tern_mat_free(&m->layer[l].t2);
+        q8_mat_free(&m->layer[l].q_wqkv);
+        q8_mat_free(&m->layer[l].q_wo);
     }
     if (m->owns_params) {
         free(m->params);
@@ -369,6 +422,26 @@ static void attention_rows(spel_model *m, int l, float *qkv, int M,
 
 /* ----------------------------------------------------- recurrent layer */
 
+static void proj_qkv(spel_model *m, spel_layer *L, const float *x, float *y,
+                     int M, int d) {
+    if (m->is_ternary && L->q_wqkv.q) {
+        for (int r = 0; r < M; r++)
+            q8_gemv(&L->q_wqkv, x + (size_t)r * d, y + (size_t)r * 3 * d);
+    } else {
+        matmul_rows(y, x, L->wqkv, M, 3 * d, d);
+    }
+}
+
+static void proj_wo(spel_model *m, spel_layer *L, const float *x, float *y,
+                    int M, int d) {
+    if (m->is_ternary && L->q_wo.q) {
+        for (int r = 0; r < M; r++)
+            q8_gemv(&L->q_wo, x + (size_t)r * d, y + (size_t)r * d);
+    } else {
+        matmul_rows(y, x, L->wo, M, d, d);
+    }
+}
+
 static void linear_rows(spel_model *m, int l, const float *xn, int M,
                         float *qkv, float *out, float *cx) {
     const spel_cfg *c = &m->cfg;
@@ -397,7 +470,7 @@ static void linear_rows(spel_model *m, int l, const float *xn, int M,
         memcpy(xh + (size_t)(p % SPEL_XH_RING) * d, x, (size_t)d * sizeof(float));
     }
 
-    matmul_rows(qkv, cx, L->wqkv, M, 3 * d, d);
+    proj_qkv(m, L, cx, qkv, M, d);
     for (int r = 0; r < M; r++) {
         int p = base + r;
         float *qr = qkv + (size_t)r * 3 * d;
@@ -480,7 +553,7 @@ static void mlp_rows(spel_model *m, int l, const float *xn, int M,
 void spel_forward(spel_model *m, const int *tokens, int M, float *logits_out) {
     const spel_cfg *c = &m->cfg;
     const int d = c->d_model, dff = c->d_ff;
-    if (M <= 0 || m->pos + M > c->max_seq || M > c->spec_k) return;
+    if (M <= 0 || m->pos + M > c->max_seq || M > c->spec_k + 1) return;
 
     float *x    = m->buf;
     float *xn   = x + (size_t)M * d;
@@ -503,9 +576,9 @@ void spel_forward(spel_model *m, const int *tokens, int M, float *logits_out) {
         rmsnorm_rows(x, L->n1, xn, M, d);
 
         if (!c->is_linear[l]) {
-            matmul_rows(qkv, xn, L->wqkv, M, 3 * d, d);
+            proj_qkv(m, L, xn, qkv, M, d);
             attention_rows(m, l, qkv, M, tmp);
-            matmul_rows(obuf, tmp, L->wo, M, d, d);
+            proj_wo(m, L, tmp, obuf, M, d);
         } else {
             linear_rows(m, l, xn, M, qkv, tmp, h1);
             if (m->cap_enabled && m->cap_q) {
@@ -522,7 +595,7 @@ void spel_forward(spel_model *m, const int *tokens, int M, float *logits_out) {
                     }
                 }
             }
-            matmul_rows(obuf, tmp, L->wo, M, d, d);
+            proj_wo(m, L, tmp, obuf, M, d);
         }
         for (int r = 0; r < M; r++)
             for (int i = 0; i < d; i++) x[(size_t)r * d + i] += obuf[(size_t)r * d + i];
@@ -617,81 +690,149 @@ void spel_spec_cfg_default(spel_spec_cfg *s, int K) {
 void spel_spec_generate(spel_model *target, spel_model *draft,
                         int n_gen, int *out, const spel_spec_cfg *sc,
                         spel_spec_stats *st) {
+    if (!target || !draft || !sc || !st) return;
     const spel_cfg *c = &target->cfg;
     const int K = sc->K, V = c->vocab;
-    if (K > c->spec_k) return;
     memset(st, 0, sizeof(*st));
+    if (K < 1 || K > c->spec_k || n_gen <= 0) return;
+    if (target->pos + n_gen > c->max_seq || draft->pos + n_gen > c->max_seq)
+        return;
+
+    /* Speculative rounds need up to K+1 transient positions. If the context is
+     * too tight, fall back to AR rather than silently truncating a forward. */
+    if (target->pos + n_gen + K + 1 > c->max_seq) {
+        for (int i = 0; i < n_gen; i++) {
+            int tok = spel_argmax(target->last_logits, V);
+            spel_forward(target, &tok, 1, NULL);
+            spel_forward(draft, &tok, 1, NULL);
+            out[i] = tok;
+        }
+        st->rounds = st->ar_rounds = st->emitted = n_gen;
+        st->tokens_per_round = 1.0;
+        return;
+    }
 
     float *saved = (float *)malloc((size_t)V * sizeof(float));
-    float *tlog = (float *)malloc((size_t)(K + 1) * V * sizeof(float));
+    float *tlog = (float *)malloc((size_t)(K + 2) * V * sizeof(float));
     int *prop  = (int *)malloc((size_t)K * sizeof(int));
+    if (!saved || !tlog || !prop) {
+        free(saved); free(tlog); free(prop);
+        return;
+    }
     int alpha_win[16] = {0};
     int win_pos = 0, win_fill = 0;
+    int window = sc->window > 0 ? sc->window : 1;
+    if (window > 16) window = 16;
     int fallback = 0;
+    int pending = -1;     /* emitted correction, not yet consumed by the models */
     int emitted = 0;
 
     while (emitted < n_gen) {
-        int use_spec = !sc->governor || !fallback;
-        if (use_spec) {
-            memcpy(saved, target->last_logits, (size_t)V * sizeof(float));
-            for (int j = 0; j < K; j++) {
-                prop[j] = spel_argmax(draft->last_logits, V);
-                spel_forward(draft, &prop[j], 1, NULL);
-                st->proposed++;
+        if (fallback) {
+            if (pending >= 0) {
+                spel_forward(target, &pending, 1, NULL);
+                spel_forward(draft,  &pending, 1, NULL);
+                pending = -1;
             }
-            memcpy(tlog, saved, (size_t)V * sizeof(float));
-            spel_forward(target, prop, K, tlog + V);
-            int m = 0;
-            while (m < K && spel_argmax(tlog + (size_t)m * V, V) == prop[m]) m++;
-            int corr = spel_argmax(tlog + (size_t)m * V, V);
-
-            /* Transactional rewind: O(1). Stale KV is masked by pos; the
-             * recurrent ring slot needed after rewind is still intact, and the
-             * correction overwrites the one slot written by the rejected token. */
-            target->pos -= K - m;
-            draft->pos  -= K - m;
-            spel_forward(target, &corr, 1, NULL);
-            spel_forward(draft,  &corr, 1, NULL);
-
-            for (int j = 0; j < m && emitted < n_gen; j++) out[emitted++] = prop[j];
-            if (emitted < n_gen) out[emitted++] = corr;
-
-            st->rounds++;
-            st->spec_rounds++;
-            st->accepted += m;
-            st->emitted += m + 1;
-            st->corr++;
-
-            if (sc->governor) {
-                int trip = (m == 0);
-                if (!trip) {
-                    alpha_win[win_pos] = m;
-                    win_pos = (win_pos + 1) % sc->window;
-                    if (win_fill < sc->window) win_fill++;
-                    if (win_fill == sc->window) {
-                        int s = 0;
-                        for (int i = 0; i < sc->window; i++) s += alpha_win[i];
-                        if ((double)s / (double)(sc->window * K) < sc->alpha_threshold)
-                            trip = 1;
-                    }
-                }
-                if (trip) {
-                    /* Suspend drafting for the rest of this call. Resuming
-                     * requires replaying the accepted suffix into the draft;
-                     * keeping it warm here would defeat the governor. */
-                    fallback = 1;
-                    win_fill = 0;
-                    st->governor_trips++;
-                }
-            }
-        } else {
             int tok = spel_argmax(target->last_logits, V);
             spel_forward(target, &tok, 1, NULL);
             out[emitted++] = tok;
             st->rounds++;
             st->ar_rounds++;
             st->emitted++;
+            continue;
         }
+
+        const int base = target->pos;
+        const int has_pending = pending >= 0;
+
+        if (has_pending) {
+            /* The correction token was emitted last round but deliberately not
+             * forwarded. Consume it in the draft now; the target consumes it as
+             * the first token of the verification batch. */
+            spel_forward(draft, &pending, 1, NULL);
+        } else {
+            memcpy(saved, target->last_logits, (size_t)V * sizeof(float));
+        }
+
+        for (int j = 0; j < K; j++) {
+            prop[j] = spel_argmax(draft->last_logits, V);
+            spel_forward(draft, &prop[j], 1, NULL);
+            st->proposed++;
+        }
+
+        int m = 0, corr = 0;
+        if (has_pending) {
+            int toks[SPEL_MAX_BATCH + 1];
+            toks[0] = pending;
+            for (int j = 0; j < K; j++) toks[j + 1] = prop[j];
+            spel_forward(target, toks, K + 1, tlog);
+            while (m < K && spel_argmax(tlog + (size_t)m * V, V) == prop[m]) m++;
+            corr = spel_argmax(tlog + (size_t)m * V, V);
+            target->pos = base + 1 + m;
+            draft->pos  = base + 1 + m;
+        } else {
+            memcpy(tlog, saved, (size_t)V * sizeof(float));
+            spel_forward(target, prop, K, tlog + V);
+            while (m < K && spel_argmax(tlog + (size_t)m * V, V) == prop[m]) m++;
+            corr = spel_argmax(tlog + (size_t)m * V, V);
+            target->pos = base + m;
+            draft->pos  = base + m;
+        }
+
+        /* Emit accepted proposals. If n_gen ends inside the accepted prefix,
+         * leave both models exactly after the last emitted token. */
+        int e = 0;
+        while (e < m && emitted < n_gen) out[emitted++] = prop[e++];
+        if (emitted >= n_gen) {
+            int consumed = (has_pending ? 1 : 0) + e;
+            target->pos = base + consumed;
+            draft->pos  = base + consumed;
+            memcpy(target->last_logits, tlog + (size_t)e * V,
+                   (size_t)V * sizeof(float));
+            pending = -1;
+            st->accepted += m;
+            st->rounds++;
+            st->spec_rounds++;
+            st->emitted += e;
+            break;
+        }
+
+        out[emitted++] = corr;
+        pending = corr;
+        st->accepted += m;
+        st->rounds++;
+        st->spec_rounds++;
+        st->emitted += m + 1;
+        st->corr++;
+
+        if (sc->governor) {
+            int trip = (m == 0);
+            if (!trip) {
+                alpha_win[win_pos] = m;
+                win_pos = (win_pos + 1) % window;
+                if (win_fill < window) win_fill++;
+                if (win_fill == window) {
+                    int s = 0;
+                    for (int i = 0; i < window; i++) s += alpha_win[i];
+                    if ((double)s / (double)(window * K) < sc->alpha_threshold)
+                        trip = 1;
+                }
+            }
+            if (trip) {
+                /* Suspend drafting for the rest of this call. The pending
+                 * correction is consumed before the AR fallback so the target
+                 * state stays aligned with the emitted stream. */
+                fallback = 1;
+                win_fill = 0;
+                st->governor_trips++;
+            }
+        }
+    }
+
+    if (pending >= 0) {
+        spel_forward(target, &pending, 1, NULL);
+        spel_forward(draft,  &pending, 1, NULL);
     }
     st->alpha = st->proposed ? (double)st->accepted / (double)st->proposed : 0.0;
     st->tokens_per_round = st->rounds ? (double)st->emitted / (double)st->rounds : 0.0;

@@ -24,9 +24,9 @@
 #define SPEL_MAX_DFF      1536
 #define SPEL_MAX_SEQ      4096
 #define SPEL_MAX_VOCAB    1024
-#define SPEL_MAX_BATCH    8
+#define SPEL_MAX_BATCH    16
 #define SPEL_MAX_CHANNELS (SPEL_MAX_LAYERS * SPEL_MAX_HEADS)
-#define SPEL_XH_RING      16
+#define SPEL_XH_RING      32
 #define SPEL_ROPE_THETA   10000.0f
 
 /* ------------------------------------------------------------------ cfg */
@@ -66,6 +66,27 @@ void   tern_gemv(const tern_mat *m, const float *x, float *y);
 extern int tern_kernel_mode;
 const char *tern_kernel_name(void);
 
+/* Fast math: when 1, batched (M>1) FP32 projections use Accelerate
+ * cblas_sgemm. This changes floating-point summation order, so results are
+ * token-equivalent in practice but not bit-identical to the strict path.
+ * Default 0: strict, bit-identical batched vs sequential. */
+extern int spel_use_accelerate;
+
+/* ------------------------------------------------------------- q8 int8 */
+/* Symmetric per-row int8 weights for the cheap draft's non-MLP projections.
+ * Activations are quantized dynamically per GEMV, exactly like tern_gemv. */
+
+typedef struct {
+    int8_t *q;      /* nrows * ncols */
+    float  *scale;  /* nrows */
+    int     nrows, ncols;
+} q8_mat;
+
+int  q8_mat_init(q8_mat *m, int nrows, int ncols);
+void q8_mat_free(q8_mat *m);
+void q8_quantize_mat(q8_mat *m, const float *w);
+void q8_gemv(const q8_mat *m, const float *x, float *y);
+
 /* --------------------------------------------------------------- model */
 
 typedef struct {
@@ -78,6 +99,7 @@ typedef struct {
     float *wa, *wb;/* [heads] (linear only) */
     float *n1, *n2;
     tern_mat t1, t2, t3;  /* optional ternary MLP (draft) */
+    q8_mat q_wqkv, q_wo;  /* optional int8 projections (draft) */
 } spel_layer;
 
 typedef struct {
@@ -108,6 +130,10 @@ typedef struct {
 
 spel_model *spel_model_new(const spel_cfg *cfg, uint64_t seed);
 spel_model *spel_model_new_draft(const spel_model *target);
+/* Draft from a subset of target layers. layer_map[i] is the source layer for
+ * draft layer i. Non-MLP weights are shared; MLPs are ternary copies. */
+spel_model *spel_model_new_draft_subset(const spel_model *target,
+                                        const int *layer_map, int n_layers);
 void        spel_model_free(spel_model *m);
 void        spel_model_reset(spel_model *m);
 
@@ -115,7 +141,8 @@ void        spel_model_reset(spel_model *m);
 int  spel_capture_alloc(spel_model *m, int max_pos);
 void spel_capture_free(spel_model *m);
 
-/* Forward M contiguous tokens starting at m->pos. logits may be NULL. */
+/* Forward M contiguous tokens starting at m->pos. logits may be NULL.
+ * M may be up to cfg->spec_k + 1 (the deferred-correction batch). */
 void spel_forward(spel_model *m, const int *tokens, int M, float *logits);
 int  spel_argmax(const float *v, int n);
 
@@ -130,6 +157,8 @@ void       spel_ckpt_free(spel_ckpt *c);
 /* ----------------------------------------------------------- note bank */
 
 #define NB_MAX_NOTES 96
+#define NB_RANK_SIM   0   /* summed per-channel cosine similarity (default) */
+#define NB_RANK_VOTES 1   /* one integer vote per channel, paper-style */
 
 typedef struct {
     int chunk;
@@ -145,6 +174,7 @@ typedef struct {
     int budget;        /* span budget  (paper: 64) */
     int per_chunk;     /* notes per chunk (paper: 2) */
     int addr_dim;      /* 16 */
+    int rank_mode;     /* NB_RANK_SIM or NB_RANK_VOTES */
     int n_notes;
     int n_channels, dh;
     int *proj_idx;     /* [n_channels][addr_dim] coordinates */
