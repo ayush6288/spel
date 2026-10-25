@@ -1,7 +1,6 @@
 spel
 *.o
 .DS_Store
-results/
 .venv/
 weights/
 __pycache__/

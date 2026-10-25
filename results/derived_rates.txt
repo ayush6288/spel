@@ -1,0 +1,14 @@
+21M: params=21,352,044 fp32_bytes=85,408,176 (81.45 MiB)
+  AR 366.5-371.0 tok/s -> 7.826-7.922 GMAC/s
+  effective weight read 29.15-29.51 GiB/s
+  ms/token 2.695-2.729
+218M: params=218,436,992 fp32_bytes=873,747,968 (833.27 MiB)
+  AR 29.5-29.9 tok/s -> 6.444-6.531 GMAC/s
+  effective weight read 24.01-24.33 GiB/s
+  ms/token 33.445-33.898
+ratio params 218M/21M = 10.2303
+ratio AR 21M/218M = 12.4242
+per-layer A: linear=6.757 MiB attn=6.753 MiB
+per-layer B: linear=52.020 MiB attn=52.008 MiB
+draft 21M: q8=2,383,872 B (2.273 MiB) tern=1,218,560 B (1.162 MiB) total=3,602,432 B (3.436 MiB)
+draft 218M: q8=16,842,752 B (16.062 MiB) tern=9,551,872 B (9.109 MiB) total=26,394,624 B (25.172 MiB)

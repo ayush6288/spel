@@ -1,0 +1,7 @@
+  config: d_model=384 n_layers=12 n_heads=6 head_dim=64 d_ff=1024 vocab=128 max_seq=512 attn_period=4 spec_k=16 draft_map=[0,3,6,9]
+  target params: 21352044  FP32: 85408176 bytes (81.45 MiB)
+  draft params: 7084452  FP32: 28337808 bytes (27.03 MiB)
+  file: 113762508 bytes (108.49 MiB)
+  tolerance: 0.001
+  target: max_abs=7.39098e-06  argmax=16/16
+  draft : max_abs=0.0188234  argmax=16/16

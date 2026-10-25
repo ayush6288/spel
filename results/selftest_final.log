@@ -1,0 +1,42 @@
+./spel selftest
+== SPEL selftest ==
+[1] ternary pack / dot / GEMV
+  kernels: neon-dotprod (dotprod/addsub/scalar agree)
+[2] batched verification == sequential AR (bitwise)
+  256 logits compared, 0 differ
+[3] speculative decode: exact greedy fidelity + rollback
+  plain:   40/40 tokens match, alpha=0.120, trips=0
+  governor: 32/32 match, alpha=0.000, AR rounds=31, trips=1
+  K=16:    32/32 tokens match, alpha=0.021, trips=0
+  K=16 gov:32/32 match, alpha=0.031, AR rounds=29, trips=1
+[4] NoteBank writer / addressing / replay
+  chunks=3 notes=6 write=0.41 ms
+  note spans: [28,52) [86,110) [158,182) [215,239) [294,318) [319,343)
+  writer needle 0 @40 -> note 0 ok
+  writer needle 1 @170 -> note 2 ok
+  writer needle 2 @300 -> note 4 ok
+  address needle 0 -> notes 0,3,-1,-1  hit=1  0.022 ms
+      value rank: no-replay=73 replay=73 (V=128)
+  address needle 1 -> notes 0,2,-1,-1  hit=1  0.025 ms
+      value rank: no-replay=92 replay=92 (V=128)
+  address needle 2 -> notes 4,0,-1,-1  hit=1  0.021 ms
+      value rank: no-replay=6 replay=6 (V=128)
+  votes needle 0 -> notes 0,3  hit=1
+  votes needle 1 -> notes 1,0  hit=0
+  votes needle 2 -> notes 4,1  hit=1
+  vote recall: 2/3 (similarity ranking remains default)
+  storage: notes=6720 B  dense-KV=3145728 B (468x)  hybrid-KV=786432 B (117.0x)
+[5] Accelerate fast path: token equivalence (not bitwise)
+  strict AR vs fast spec: 24/24 tokens match
+  batched logits: 248/256 bits differ, argmax differs at 0/4 positions
+[6] forced-acceptance benchmark path (not real decoding)
+  alpha=0.75: emitted=32 accepted=30/40 alpha=0.750 6.40 tok/round
+  alpha=1.00: emitted=32 accepted=32/32 alpha=1.000 8.00 tok/round
+[7] SPELW001 save/load round-trip + SPELV001 golden verify
+  tolerance: 0.001
+  target: max_abs=0  argmax=16/16
+  draft : max_abs=0  argmax=16/16
+[8] draft GEMV pool: threads=1 vs threads=4 bit-exact
+  draft logits: 16 x 128 floats, 0 differ (threads 1 vs 4)
+
+PASS (0 failures)

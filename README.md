@@ -1,42 +1,346 @@
-# SPEL — NoteBank + SubTernary research harness
+# SPEL: Low-Bit Speculative Execution & Episodic Memory on Apple Silicon
 
-A self-contained C11 harness for four things on Apple silicon:
+A bare-metal C11 research harness implementing and evaluating **Unified Speculative Decoding (SubTernary)** and **Sparse Episodic Memory (NoteBank)** on Apple Silicon (ARMv9-A / Apple M5).
 
-1. **2-bit ternary GEMV** with ARM NEON (`{-1, 0, +1}`, per-row scale).
-2. **A deterministic hybrid model** — Gated-DeltaNet-style recurrent layers plus
-   RoPE attention — with batched verification and checkpoints.
-3. **Transactional speculative decoding** with O(1) commit/rollback, a deferred
-   correction token, a governor that falls back to autoregressive (AR)
-   decoding, and a forced-acceptance system oracle.
-4. **A NoteBank-style writer, compact address bank, state branching and replay
-   demo**, wired through to the speculative loop.
+SPEL investigates two core bottlenecks in edge inference:
 
-> **Status: research harness, not a model release.** The repository has a
-> binary checkpoint format, a golden numerical verifier, a cheap-draft oracle,
-> and a self-contained PyTorch training/QAT script. It does **not** ship the
-> trained checkpoint used for the measurements below; that file is
-> `weights/spel.bin` locally and is gitignored. Forced-acceptance rows are
-> systems measurements, not real decoding quality.
+1. **DRAM-resident autoregressive decode**, where each token streams the target weights and memory bandwidth is a candidate limiter. SPEL addresses this with 2-bit ternary draft proposals, a persistent draft-only thread pool, and O(1) transactional rollback.
+2. **Context-memory growth in recurrent/attention hybrids**, addressed with chunked key-distinctiveness indexing, compact BF16 addresses, branch-isolated state snapshots, and replay scheduling.
 
-## Build and run
+> **Artifact status.** This is a research harness, not a model release. The 21.35M-parameter checkpoint is trained but is not committed (`weights/` is gitignored). The 218.44M-parameter checkpoint is a **C-generated random model** used only to validate the scaled runtime and measure DRAM-resident systems behavior; it has no language quality or learned acceptance. Forced-acceptance rows are benchmark-only system ceilings, not decoding results. Raw measurement captures are in [`results/`](results/).
 
-Requirements: macOS on ARM64 with NEON dot-product support, clang, and the
-Accelerate framework. The Makefile targets the M5 with `-mcpu=apple-m5`.
+**Measured code revisions:** `36a158e` (Phase 2: persistent draft pool, 21M steady-state decode, and NoteBank demo) and `cceae5b` (Phase 3: runtime configuration, 21M re-verification, scaled synthetic generation/verification, and final self-test). All measured numbers below are transcribed from the captures in `results/`; derived quantities are identified explicitly.
+
+---
+
+## 1. System Architecture & Kernel Innovations
+
+SPEL is organized around four inference primitives plus the NoteBank memory subsystem.
+
+### 1.1 ARM NEON 2-bit ternary GEMV (`ternary.c`)
+
+- Symmetric 4-weight/byte packing with low bits first: code `0 -> 0`, `1 -> +1`, `3 -> -1`; code `2` decodes as zero.
+- Per-row symmetric quantization with three least-squares scale-refinement iterations, followed by dynamic int8 activation quantization at GEMV time.
+- Three interchangeable row kernels: `neon-dotprod` using `vdotq_s32`, `neon-addsub` using vector mask/add, and a portable scalar fallback. The two NEON kernels return identical integer dot products in the self-test; kernel selection is exposed through `tern_kernel_mode`.
+
+Measured on the 4096 x 1536 kernel benchmark, single thread:
+
+| kernel | GMAC/s | weight GB/s | ms/GEMV |
+|---|---:|---:|---:|
+| `neon-dotprod` | 17.72–17.87 | 4.4–4.5 | 0.35–0.36 |
+| `neon-addsub` | 10.66–10.69 | 2.7 | 0.59 |
+| scalar | 2.51–2.52 | 0.6 | 2.50 |
+| FP32 NEON | 5.84–6.67 | 23.4–26.7 | — |
+
+Packed weights are **1.50 MiB** versus **24.00 MiB** FP32. The dot-product kernel is **2.66–3.06x** the measured FP32 per-MAC rate on this shape.
+
+### 1.2 Deterministic hybrid architecture (`model.c`)
+
+The default model is a 12-layer, 384-wide hybrid with 6 heads, 64-wide head dimensions, a 1024-wide SwiGLU, and a 4-layer attention period: **9 Gated-DeltaNet recurrent layers + 3 causal RoPE attention layers**. A 16-layer, 1024-wide, 16-head scaled shape is also supported (12 recurrent + 4 attention layers).
+
+Each layer is `RMSNorm -> mixer -> residual -> RMSNorm -> SwiGLU -> residual`. The recurrent mixer uses a 3-tap causal convolution, L2-normalized keys/queries, per-head decay and write rate, and the delta-rule update:
+
+```text
+S_t = a * S_{t-1} + beta * (v - S_{t-1} k) k^T
+o   = S_t q / sqrt(head_dim)
+```
+
+Attention uses interleaved even/odd RoPE pairs, `theta=10000`, per-head q/k L2 normalization, and a conventional KV cache.
+
+**Verification path.** `spel_forward(..., M, ...)` compiles the target batch into one pass. In strict mode, batched projections preserve the same NEON accumulation order as single-token AR and are bit-identical to sequential decoding. In fast mode, batched projections use Accelerate `cblas_sgemm`/AMX; this is token-equivalent on the tested inputs but not bit-identical. The speculative round defers the correction token: the target verifies `[pending, proposal_0, ..., proposal_{K-1}]` in one `K+1` batch, and the next round consumes the correction as its pending token, eliminating a separate `+1` target pass.
+
+### 1.3 Transactional KV and recurrent-state isolation
+
+- Attention rollback is a position reset; KV slots beyond `pos` are masked and reused. Accepted KV stays in place.
+- Recurrent state lives in a `(K+1)`-slot ring per layer. A rollback only moves the read position; stale slots are overwritten by the next round.
+- The measured commit/rollback primitive is **~0.5 ns**, at the benchmark timer floor. For comparison, copying the 21M model's 4.50 MiB attention KV takes **108.2–112.7 us** in the steady-state captures; the ratio is **2.40–2.50 x 10^5**. At 218M, copying the 16.00 MiB KV takes **446.1–561.8 us**.
+- The **Dynamic Speculation Governor** tracks rolling accepted/proposed ratio over a window. It suspends drafting and runs the remainder of the call autoregressively when acceptance falls below `alpha_threshold`, or when a round accepts zero proposals. It does not resume drafting mid-call.
+
+### 1.4 Persistent draft GEMV pool (`spel_gemv_pool`)
+
+- A draft owns a persistent pthread pool created once per draft and reused across all draft GEMVs.
+- Worker count is `SPEL_DRAFT_THREADS=1..6` (default **1**), or `spel_model_set_threads()` for tests. The target path is never parallelized.
+- Work is row-parallel. Each worker takes `BLOCK = ceil(rows / (threads*6))` rows of the existing q8 or ternary kernel. No floating-point reduction crosses threads, so the pooled and serial draft logits are bit-identical.
+- The pool uses hybrid atomic spin plus condition-variable dispatch to avoid per-GEMV thread creation and to keep the target from competing with idle draft workers.
+- It lowers the draft cost `c` from **0.12x** to **0.08x** at 21M, and from **0.08–0.09x** to **0.03–0.04x** at 218M. It does not change target verification `v`.
+
+Self-test `[8]` compares all `16 x 128` draft logits at 1 and 4 workers: **0 differ**.
+
+### 1.5 NoteBank episodic memory (`notebank.c`)
+
+- Chunked writer over captured native Q/K for every recurrent layer-head channel.
+- Key distinctiveness is `1 - <k_hat, mu_hat>`, where `mu_hat` is the normalized chunk-mean key. The writer selects high-distinctiveness spans and stores **16 BF16 coordinates** per channel from a fixed sparse projection.
+- Addressing scores each note per channel, then ranks by summed channel similarity. Per-channel integer voting is implemented as an opt-in diagnostic (`NB_RANK_VOTES`), which is not the default.
+- State branching is a snapshot/restore of `S_T`: the demo captures `S_T`, runs the retrieval branch with activation capture, restores `S_T`, then runs the read/replay branch. `S_retrieval` and `S_read` are branch labels over the same checkpointed state, not separate model copies.
+- Replay is scheduled by **token re-prefill**. Native decode-time recurrent-state injection is not implemented.
+
+---
+
+## 2. Experimental Outcomes & Regimes
+
+### 2.1 Measurement protocol
+
+Hardware: Apple M5 MacBook Air, 10 cores (4 performance + 6 efficiency), 16 GB unified memory, macOS. Build: `clang -O3 -mcpu=apple-m5 -ffast-math -std=gnu11 -Wall -Wextra -pthread`; links `-lm -framework Accelerate`.
+
+- Decode benchmark: 64-token prompt, 8 warm tokens, 64 generated tokens, K=16 unless stated. Target AR is the baseline.
+- Headline decode ranges span three steady-state process runs per regime: `phase2_bench2–4` for 21M and `phase3_scaled_bench1–3` for 218M. B1 is repeated inside every bench capture; its tabled range spans the captures in `results/`. B2/B3 verification-cost ranges use the same three steady-state runs. Forced-acceptance rows are the median of three internal repetitions per process run.
+- `c` is draft time divided by AR target time. `v` is one `K+1` target verification divided by one AR token. These are system ratios, not FLOP-normalized efficiencies.
+- Derived rates use verifier parameter counts and measured tok/s: one MAC per target parameter per token, and one FP32 target-weight read per token. The derivation is in [`results/derived_rates.txt`](results/derived_rates.txt).
+- The 21.35M checkpoint is trained externally. The 218.44M checkpoint is random and synthetic. No training log or JSON sidecar is present in the repository.
+
+Raw captures:
+
+| measurement | capture |
+|---|---|
+| final self-test | [`results/selftest_final.log`](results/selftest_final.log) |
+| 21M verified checkpoint | [`results/verify_trained_21m.log`](results/verify_trained_21m.log) |
+| 21M steady-state decode runs | [`results/phase2_bench2.log`](results/phase2_bench2.log), [`results/phase2_bench3.log`](results/phase2_bench3.log), [`results/phase2_bench4.log`](results/phase2_bench4.log) |
+| 21M early run with 4-thread outliers | [`results/phase2_bench1.log`](results/phase2_bench1.log) |
+| 21M later sanity run (excluded from headline ranges) | [`results/phase3_default_bench.log`](results/phase3_default_bench.log) |
+| 218M loader/verifier | [`results/verify_scaled_synth_218m.log`](results/verify_scaled_synth_218m.log) |
+| 218M decode runs | [`results/phase3_scaled_bench1.log`](results/phase3_scaled_bench1.log), [`results/phase3_scaled_bench2.log`](results/phase3_scaled_bench2.log), [`results/phase3_scaled_bench3.log`](results/phase3_scaled_bench3.log) |
+| NoteBank demo with trained checkpoint | [`results/phase2_demo.log`](results/phase2_demo.log) |
+| derived rates | [`results/derived_rates.txt`](results/derived_rates.txt) |
+
+### 2.2 Regime A: 21M Cache-Resident Model (Trained Checkpoint)
+
+**Operational label.** The 21M model is the small-working-set regime. The full **81.45 MiB** target is not wholly resident in the M5 system-level cache (SLC); the cache-resident description refers to its **6.75–6.76 MiB per-layer weight slice**, which is cache-sized. The benchmark does not include cache-occupancy counters. See the correction in §3.
+
+| property | measured |
+|---|---:|
+| target | 12 layers, d=384, 6 heads, head_dim=64, d_ff=1024, 9 GDN + 3 attention |
+| target parameters | 21,352,044 |
+| target FP32 size | 85,408,176 B = 85.41 MB = **81.45 MiB** |
+| draft | 4 layers `[0,3,6,9]`, 7,084,452 params = 28,337,808 B = **27.03 MiB FP32** |
+| draft packed compute | **3,602,432 B = 3.44 MiB** total (q8 2.27 MiB + ternary 1.16 MiB) |
+| checkpoint file | 113,762,508 B = **108.49 MiB** |
+| verification tolerance | 1e-3 |
+
+The packed figure excludes retained FP32 draft latents and shared embedding, final norm, LM head, and RoPE tables. The ternary MLP alone is **1.16 MiB**; the 3.60 MB figure is the total packed q8+ternary footprint, not the ternary MLP alone.
+
+**PyTorch/C equivalence.** The trained checkpoint verifies:
+
+```text
+target: max_abs=7.39098e-06  argmax=16/16
+draft : max_abs=0.0188234    argmax=16/16
+```
+
+The target pass condition is `argmax=16/16` and `max_abs < 1e-3`; the draft is reported but not part of the pass condition because it is quantized after loading. A C save/load round-trip reports `max_abs=0` for both models.
+
+**Microarchitectural result.** Single-token AR is **366.5–371.0 tok/s** (2.695–2.729 ms/token). The measured effective weight-read rate is **29.15–29.51 GiB/s**, and the implied target compute rate is **7.83–7.92 GMAC/s**. That is within about 1.2x of the top of the standalone FP32 NEON kernel range (**5.84–6.67 GMAC/s**) on this machine. This is consistent with compute-bound execution, not memory-bandwidth saturation, despite the 81.45 MiB total footprint; no hardware bandwidth counters were collected.
+
+**Draft efficiency.**
+
+| path | threads | tok/s | c |
+|---|---:|---:|---:|
+| draft 4L only | 1 | 2973.8–2981.9 | 0.12x |
+| draft 4L only | 4 | 4394.7–4627.6 | 0.08x |
+
+The 1-to-4-worker steady-state speedup is **1.47–1.55x**. One early 4-thread run measured 1514.2 tok/s (`c=0.24x`) and is retained in `results/phase2_bench1.log`; it is excluded from the steady-state range but is a measured variance/limitation, not a deleted result.
+
+**Speculative decode.**
+
+| path | threads | K | tok/s | vs AR | acceptance |
+|---|---:|---:|---:|---:|---|
+| AR target | — | — | 366.5–371.0 | 1.00x | — |
+| raw | 1 | 16 | 142.0–144.1 | 0.38–0.39x | alpha=0.052; 29/560 proposals |
+| raw | 4 | 16 | 168.7–171.0 | 0.46x | alpha=0.052; 29/560 proposals |
+| governed | 1 | 16 | 341.5–344.0 | 0.92–0.94x | alpha=0.094; 1 trip; 59 AR rounds |
+| governed | 4 | 16 | 356.2–361.0 | 0.96–0.97x | alpha=0.094; 1 trip; 59 AR rounds |
+
+Raw speculation **loses** on this checkpoint. The governor trips early (one trip) and falls back to AR, reaching **0.96–0.97x** AR at 4 threads. It is a safety mechanism that recovers near-baseline speed; it is not a real speedup.
+
+**Forced-acceptance system ceilings.** These rows are benchmark-only: the draft and target forwards execute for real, but the accepted prefix is forced after the fact. They are not decoding quality.
+
+| path | threads | K | tok/s | vs AR | forced alpha |
+|---|---:|---:|---:|---:|---:|
+| oracle-4L | 1 | 16 | 1016.6–1019.9 | 2.75–2.78x | 0.750 |
+| oracle-4L | 1 | 16 | 1274.5–1290.8 | 3.45–3.52x | 1.000 |
+| oracle-12L full copy | 1 | 16 | 302.4–311.0 | 0.82–0.85x | 1.000 |
+
+The full-copy oracle remains below AR even at 100% acceptance: a target-sized draft pays roughly one full target forward per proposal. The cheap-draft ceiling is real only under forced acceptance; real raw acceptance on this checkpoint is 0.052.
+
+### 2.3 Regime B: 218M DRAM-Resident Model (Systems Scaling)
+
+> **Checkpoint caveat.** This 218.44M model uses **random synthetic weights** generated through the C save path. It is not trained, not committed, and cannot support language-quality, learned-acceptance, or PyTorch/C equivalence claims. Its verifier result is a loader/format self-consistency check.
+
+| property | measured |
+|---|---:|
+| target | 16 layers, d=1024, 16 heads, head_dim=64, d_ff=3072, 12 GDN + 4 attention |
+| target parameters | 218,436,992 |
+| target FP32 size | 873,747,968 B = 873.75 MB = **833.27 MiB** |
+| draft | 4 layers `[0,3,6,9]`, 54,543,456 params = 218,173,824 B = **208.07 MiB FP32** |
+| draft packed compute | **26,394,624 B = 25.17 MiB** (q8 16.06 MiB + ternary 9.11 MiB) |
+| checkpoint file | 1,091,938,316 B = **1041.35 MiB** |
+
+**Loader/verifier.** The C-generated file verifies at `max_abs=0`, `argmax=16/16` at tolerance 1e-3. This only proves that the scaled header, tensor order, draft map, quantizers, and golden footer are self-consistent. It does **not** establish Python/C numerical agreement at 1024-wide scale.
+
+**Execution regime.** The full target is 833.27 MiB; each layer streams **52.01–52.02 MiB** of FP32 weights. The model is unambiguously DRAM-resident. Measured AR is **29.5–29.9 tok/s** (33.445–33.898 ms/token), an effective **24.01–24.33 GiB/s** weight-read rate and **6.44–6.53 GMAC/s**.
+
+**Verification cost and relative amortization.**
+
+| metric | 21M | 218M |
+|---|---:|---:|
+| AR token (B3 decode) | 2.695–2.729 ms | 33.445–33.898 ms |
+| B2 M=17 strict | 41.93–42.10 ms; v=15.54–15.74 | 548.28–552.46 ms; v=16.23–16.69 |
+| B2 M=17 fast | 7.28–7.32 ms; v=2.69–2.74 | 49.97–55.16 ms; v=1.52–1.62 |
+| B3 verify K+1=17 fast | 7.34–7.36 ms; v=2.69–2.72 | 51.47–53.89 ms; v=1.54–1.59 |
+
+The absolute fast M=17 batch time grows by **6.8–7.6x**, while AR grows by **12.4x**; strict mode grows by about **13x** because it does not use AMX. The relative fast verification ratio `v` therefore falls from ~2.7x to ~1.5x. This is amortization of a much more expensive AR token, not an absolute AMX speedup. `v` is computed within each B2/B3 capture against that capture's own AR token; the AR row shows the B3 decode baseline.
+
+**Draft acceleration.**
+
+| path | threads | tok/s | c |
+|---|---:|---:|---:|
+| draft 4L only | 1 | 333.3–354.0 | 0.08–0.09x |
+| draft 4L only | 4 | 734.0–1000.2 | 0.03–0.04x |
+
+The 4-thread spread is large, about 266 tok/s, which indicates memory/scheduling sensitivity at this working-set size. The pool still lowers `c` by roughly 2–3x.
+
+**Speculative decode on random weights.**
+
+| path | threads | K | tok/s | vs AR | acceptance |
+|---|---:|---:|---:|---:|---|
+| raw | 1 | 16 | 9.9–10.2 | 0.34x | alpha=0.000; 0/1024 proposals |
+| raw | 4 | 16 | 14.1–15.0 | 0.48–0.50x | alpha=0.000; 0/1024 proposals |
+| governed | 1 | 16 | 28.2–28.9 | 0.96x | alpha=0.000; 1 trip; 63 AR rounds |
+| governed | 4 | 16 | 28.8–29.3 | 0.97–0.98x | alpha=0.000; 1 trip; 63 AR rounds |
+
+Alpha is exactly zero because the target is random. These rows demonstrate rejection behavior and governor fallback, not learned speculation.
+
+**Forced-acceptance system ceilings (synthetic weights).**
+
+| path | threads | K | tok/s | vs AR | forced alpha |
+|---|---:|---:|---:|---:|---:|
+| oracle-4L | 1 | 16 | 130.6–134.4 | 4.39–4.50x | 0.750 |
+| oracle-4L | 1 | 16 | 163.5–167.6 | 5.50–5.61x | 1.000 |
+| oracle-16L full copy | 1 | 16 | 26.0–26.4 | 0.88x | 1.000 |
+
+The forced ceiling rises with scale, but the real rows do not. The 218M experiment therefore validates a **systems ceiling**, not real SubTernary decoding.
+
+### 2.4 Cross-regime synthesis
+
+| metric | 21M trained | 218M synthetic |
+|---|---:|---:|
+| target parameters | 21,352,044 | 218,436,992 |
+| target FP32 | 81.45 MiB | 833.27 MiB |
+| per-layer FP32 weights | 6.75–6.76 MiB | 52.01–52.02 MiB |
+| AR | 366.5–371.0 tok/s | 29.5–29.9 tok/s |
+| AR effective weight rate | 29.15–29.51 GiB/s | 24.01–24.33 GiB/s |
+| AR implied MAC rate | 7.83–7.92 GMAC/s | 6.44–6.53 GMAC/s |
+| draft t1 / t4 | 2973.8–2981.9 / 4394.7–4627.6 | 333.3–354.0 / 734.0–1000.2 |
+| c t1 / t4 | 0.12 / 0.08 | 0.08–0.09 / 0.03–0.04 |
+| v at M=17 fast (B2) | 2.69–2.74 | 1.52–1.62 |
+| raw alpha | 0.052 | 0.000 (random) |
+| governed | 0.92–0.97x AR | 0.96–0.98x AR |
+| forced 0.75 | 2.75–2.78x | 4.39–4.50x |
+| forced 1.00 | 3.45–3.52x | 5.50–5.61x |
+
+**What the scaling experiment does and does not show.** DRAM residency is verified by footprint: the 218M target is 10.23x larger and each layer is 7.7x larger than the 21M layer. AR is about 12.4x slower. But the 218M target still runs at an implied **6.44–6.53 GMAC/s**, inside the measured FP32 NEON kernel range, and its effective weight-read rate is **lower** than the 21M model's. The data therefore support a **compute-limited, DRAM-resident** interpretation, not a demonstrated bandwidth-saturation point. The ratio `v` improves because AR becomes more expensive, which raises the forced oracle ceiling; it does not by itself validate a real decoding thesis.
+
+**Cost model.** In a steady-state round the accepted token count is `1 + alpha*K`; the draft pays `K+1` forwards and the target pays one `K+1` verification:
+
+```text
+speedup(alpha) = (1 + alpha*K) / ((K+1)*c + v)
+```
+
+Using the measured per-run `c` and `v` at K=16, the serial-draft projections are:
+
+| regime | alpha | projected | measured forced |
+|---|---:|---:|---:|
+| 21M | 0.75 | 2.69–2.72x | 2.75–2.78x |
+| 21M | 1.00 | 3.51–3.56x | 3.45–3.52x |
+| 218M | 0.75 | 4.24–4.38x | 4.39–4.50x |
+| 218M | 1.00 | 5.55–5.73x | 5.50–5.61x |
+
+The forced rows track the model because they use the same real draft and target forwards with a forced prefix. They are not evidence that real acceptance will approach those values.
+
+### 2.5 NoteBank evaluation
+
+The writer, addressing, branch/restore, and replay path are measured on a toy 128d/8-layer model and on the trained 384d/12-layer checkpoint:
+
+| quantity | toy 128d/8L | trained 384d/12L |
+|---|---:|---:|
+| context / chunks / notes | 384 / 3 / 6 | 384 / 3 / 6 |
+| writer time | 0.41 ms | 1.64 ms |
+| address time (Q=4, R=2) | 0.021–0.025 ms | 0.045–0.046 ms |
+| writer needle containment | 3/3 | 3/3 |
+| summed-similarity recall@2 | 3/3 | 3/3 |
+| vote-ranker recall@2 | 2/3 | 2/3 |
+| note storage | 6,720 B | 14,400 B |
+| dense KV, all layers | 3,145,728 B (468x) | 14,155,776 B (983x) |
+| hybrid attention KV | 786,432 B (117x) | 3,538,944 B (245.8x) |
+| replay value rank | 73/92/6 unchanged | 117/79/49 unchanged |
+
+Positive result: chunk-level distinctiveness contains all three planted needles, and summed-similarity addressing retrieves a needle-containing note at recall@2 of **3/3** in both configurations. The vote ranker loses (**2/3**) and remains opt-in.
+
+Negative result: replay did not improve the rank of the planted value token in any measured case; `no-replay` and `replay` ranks are identical. The branch/restore path proves scheduling and state-isolation plumbing, not a retrieval benefit. Notes are not a replacement for attention KV, and replay is additional token re-prefill.
+
+The demo's NoteBank-to-spec run on the trained checkpoint produced alpha=0.000, one governor trip, and 7 AR rounds. A separate 48-token spec run on the demo's freshly initialized random model produced 48/48 AR-matching tokens at alpha=0.036 and 1.14 tokens/round. These validate integration and greedy fidelity, not retrieval quality or trained acceptance.
+
+### 2.6 Correctness invariants
+
+`make selftest` exercises eight suites on the strict path:
+
+| suite | measured result |
+|---|---|
+| `[1]` ternary pack/dot/GEMV | dotprod, addsub, scalar agree; GEMV matches dequantized reference |
+| `[2]` batched vs sequential | 256 logits, **0 differ** |
+| `[3]` speculative fidelity | plain 40/40; governed 32/32; K=16 32/32; K=16 governed 32/32 |
+| `[4]` NoteBank | needles 3/3; similarity recall 3/3; votes 2/3; toy storage 6,720 B |
+| `[5]` fast path | strict AR vs fast spec 24/24 tokens; 248/256 logit bits differ; argmax differs 0/4 |
+| `[6]` forced acceptance | 30/40 at 0.75; 32/32 at 1.00; emitted 32/32; target/draft positions aligned |
+| `[7]` weights round-trip | `max_abs=0`, 16/16 target and draft |
+| `[8]` draft pool | 16 x 128 logits, threads 1 vs 4, **0 differ** |
+
+Strict mode is the only bit-exact path. Fast mode is token-equivalent on the tested inputs, not bit-for-bit. All guarantees are same-binary, same-flags (`-O3 -ffast-math`); cross-compiler and cross-architecture bit-exactness are not claimed.
+
+---
+
+## 3. Drawbacks, Limitations & Negative Results
+
+1. **The acceptance-rate gap is the dominant negative result.** The trained checkpoint reaches raw alpha **0.052** (29 accepted of 560 proposals) and governed alpha **0.094** on the benchmark prompt. Raw decoding runs at **0.38–0.46x AR**; the governor recovers **0.92–0.97x AR** by abandoning speculation. The repository contains no training log or sidecar metrics, so no KL-divergence reduction is reported. A claimed 98% KL reduction cannot be substantiated from this artifact and is omitted.
+
+2. **Small-model speculation is not a speedup.** The 21M target already runs at 366.5–371.0 tok/s, and its measured MAC rate is consistent with compute-bound execution. Its raw speculation loses, and its governed path is approximately parity. The 2.75–3.52x figures are forced-acceptance system ceilings. Real decoding on this checkpoint does not approach them.
+
+3. **DRAM residency is verified; bandwidth saturation is not.** The 218M target is 833.27 MiB and streams 52 MiB per layer, so it is DRAM-resident. However, its measured 6.44–6.53 GMAC/s is within the FP32 NEON kernel range, and its effective 24.0–24.3 GiB/s weight rate is lower than the 21M rate. The experiment does not establish a bandwidth-saturation ceiling. The forced 4.39–5.61x rows are systems ceilings with synthetic weights; the real rows are 0.34–0.50x raw and 0.96–0.98x governed.
+
+4. **The “cache-resident” label is layer-local, not full-model.** The full 21M target is 81.45 MiB and is not wholly SLC-resident. Each layer is 6.75–6.76 MiB, which is cache-sized. No cache counters were collected. The full target does not fit in a single on-chip cache working set.
+
+5. **Target verification remains single-threaded.** The draft pool lowers `c`, but target `v` is unchanged by threading because the target path is deliberately serial. At 218M, absolute M=17 verification is **49.97–55.16 ms** (fast) or **548.28–552.46 ms** (strict). The relative `v` drop is amortization, not a lower absolute verification cost.
+
+6. **The scaled checkpoint is synthetic.** The 218M file is a C-generated random model used for loader and systems scaling. It cannot support language quality, trained acceptance, or Python/C numerical equivalence at 1024-wide scale. A trained scaled checkpoint is still required.
+
+7. **NoteBank replay scope is limited.** `S_T` is snapshotted and restored around retrieval, but replay uses token re-prefill rather than native recurrent-state injection. Replay did not improve value rank, the vote ranker is 2/3, and notes do not replace KV. The memory path is a reference implementation, not a trained memory system.
+
+8. **Run-to-run variance is material.** The early 4-thread 21M run was 1514.2 tok/s (`c=0.24x`), versus 4394.7–4627.6 tok/s in steady state. The 218M 4-thread draft spans 734.0–1000.2 tok/s. A later 21M sanity run measured governed 334.2/323.1 tok/s and forced-0.75 870.1 tok/s, outside the three-run steady-state table; the cause was not isolated. Headline decode and forced ranges exclude that later run, and the early outlier is retained in `results/` rather than deleted.
+
+9. **Scope limits.** The tokenizer and data path are ASCII/synthetic; there is no pretrained language model, no committed trained checkpoint, no GPU/ANE path, and no multi-threaded target. Strict batched verification is bit-exact; fast AMX mode is not. `max_seq` is capped at 4096 and the benchmark uses 512.
+
+---
+
+## 4. Build, Test & Benchmark Quickstart
+
+### 4.1 Build and run
+
+Requirements: macOS on ARM64 with NEON dot-product support, clang, and Accelerate. The default Makefile target is `-mcpu=apple-m5`.
 
 ```sh
 git clone https://github.com/ayush6288/spel.git
 cd spel
 make                 # builds ./spel, links -framework Accelerate
-make selftest        # correctness tests; must print PASS (0 failures)
+make selftest        # 8 invariant suites; must print PASS (0 failures)
 make bench           # kernels + strict/fast verification + decode + rollback
-make demo            # NoteBank branch/replay/spec + a 48-token spec run
+make demo            # NoteBank branch -> retrieve -> replay -> spec demo
 
-# Compare speculative K on the same machine:
+# Compare speculative depth on the same machine:
 SPEL_BENCH_K=8  ./spel bench
 SPEL_BENCH_K=16 ./spel bench
 ```
 
-On a different ARM64 Mac, override the target:
+`make selftest` is self-contained. The decode numbers in §2 require the local trained 21M checkpoint at `weights/spel.bin`; without it, `bench` runs a randomly initialized model. `demo` uses the checkpoint for the NoteBank path when it is present and falls back to the toy configuration otherwise. The 48-token spec run is always a freshly initialized model and is a plumbing check.
+
+On another ARM64 Mac:
 
 ```sh
 make clean && make ARCH="-mcpu=apple-m1"
@@ -44,638 +348,68 @@ make clean && make ARCH="-mcpu=apple-m1"
 make clean && make ARCH="-march=native"
 ```
 
-## Binary weights and golden verification
+### 4.2 Runtime configuration
 
-`SPELW001` is a 64-byte little-endian header followed by raw FP32 tensors:
+The default shape is `d_model=384, n_layers=12, n_heads=6, head_dim=64, d_ff=1024, vocab=128`. The scaled shape is `d_model=1024, n_layers=16, n_heads=16, head_dim=64, d_ff=3072`.
 
-```text
-offset  field
-0       magic "SPELW001" (8 bytes)
-8       u32 version = 1
-12      u32 d_model
-16      u32 n_layers
-20      u32 n_heads
-24      u32 head_dim
-28      u32 d_ff
-32      u32 vocab
-36      u32 attn_period
-40      u32 n_draft_layers = 4
-44      u32 draft_map[4] = {0, 3, 6, 9}
-60      u32 has_golden_footer
-```
-
-Target tensors, in file order:
-
-```text
-emb[V][d]
-for each target layer 0..N-1:
-    n1[d], wqkv[3d][d], wo[d][d],
-    [conv[3][d], wa[H], wb[H] only for recurrent layers],
-    n2[d], w1[d_ff][d], w3[d_ff][d], w2[d][d_ff]
-normf[d]
-wout[V][d]
-```
-
-The four draft layers follow in the same order. The draft holds independent
-distilled FP32 parameters for layers `[0, 3, 6, 9]`; it shares the token
-embedding, final RMSNorm and LM head with the target. On load, C quantizes each
-draft `wqkv`/`wo` with its existing q8 quantizer and `w1`/`w3`/`w2` with the
-existing 3-step ternary least-squares quantizer. The file keeps FP32 latents,
-so QAT export is lossless with respect to the C quantizers. `spel_save_weights`
-writes an attached distilled draft, or (when no draft is attached and the
-target has at least 10 layers) a 4-layer copy using `cfg.draft_map`, whose
-default is `[0,3,6,9]`; `spel_save_weights_pair` is the explicit distilled-draft
-path.
-
-An optional `SPELV001` footer follows the weights:
-
-```text
-magic "SPELV001" (8 bytes)
-u32 seq_len = 16
-i32 tokens[16]
-f32 expected_target_logits[16][V]
-f32 expected_draft_logits[16][V]
-```
-
-The fixed probe sequence is `token[i] = (i*29 + 7) % vocab`. C save generates
-the footer from a reset state, restores the caller's state, and writes it back.
+CLI:
 
 ```sh
+./spel bench --config d_model=1024,n_layers=16,n_heads=16,head_dim=64,d_ff=3072
 ./spel verify-weights weights/spel.bin
+# When a scaled trained checkpoint exists:
+./spel verify-weights weights/spel_scaled.bin \
+  --config d_model=1024,n_layers=16,n_heads=16,head_dim=64,d_ff=3072
 ```
 
-This loads the default 384d/12-layer target and the 4-layer draft, resets both,
-runs the 16 golden tokens, and prints target and draft max-abs logit error plus
-greedy argmax agreement. Pass requires **target argmax 16/16 and target
-`max_abs < SPEL_VERIFY_TOL`**, where the tolerance defaults to **1e-3** and can
-be overridden only through `SPEL_VERIFY_TOL`. The command also prints the
-runtime dimensions, the actual target/draft parameter counts, FP32 byte sizes,
-and the checkpoint file size. Draft metrics are reported but not part of the
-pass condition because the draft is quantized after loading. A C save/load
-round-trip is also exercised by `make selftest` and currently reports
-`max_abs=0` for both models.
+Environment overrides: `SPEL_CONFIG`, `SPEL_D_MODEL`, `SPEL_N_LAYERS`, `SPEL_N_HEADS`, `SPEL_HEAD_DIM`, `SPEL_D_FF`, `SPEL_VOCAB`, `SPEL_MAX_SEQ`, `SPEL_ATTN_PERIOD`, `SPEL_SPEC_K`, `SPEL_DRAFT_MAP`, `SPEL_DRAFT_THREADS`, `SPEL_BENCH_K`, `SPEL_VERIFY_TOL`, and `SPEL_WEIGHTS`.
 
-## Phase 1 verification
-
-The downloaded Colab checkpoint was checked without changing any math:
+Draft threading:
 
 ```sh
-$ make selftest && make bench
-$ ./spel verify-weights weights/spel.bin
-  config: d_model=384 n_layers=12 n_heads=6 head_dim=64 d_ff=1024 vocab=128 max_seq=512 attn_period=4 spec_k=16 draft_map=[0,3,6,9]
-  target params: 21352044  FP32: 85408176 bytes (81.45 MiB)
-  draft params: 7084452  FP32: 28337808 bytes (27.03 MiB)
-  file: 113762508 bytes (108.49 MiB)
-  tolerance: 0.001
-  target: max_abs=7.39098e-06  argmax=16/16
-  draft : max_abs=0.0188234  argmax=16/16
+SPEL_DRAFT_THREADS=1 ./spel bench   # default
+SPEL_DRAFT_THREADS=4 ./spel bench
 ```
 
-The target passed the verifier at **16/16 argmax** with
-**target `max_abs=7.39098e-06`**, below the required `1e-3`. The draft is
-reported by the same command (`max_abs=0.0188234`, also 16/16 argmax), but only
-the target is part of the pass condition. `make selftest` printed
-`PASS (0 failures)`.
+The draft pool is draft-only; target verification is not parallelized.
 
-## Phase 2 verification: persistent draft GEMV pool
+### 4.3 Checkpoint verification
 
-The draft now owns a persistent pthread pool. `SPEL_DRAFT_THREADS=1..6` selects
-the worker count at draft construction; the default is **1**, which keeps the
-original serial loops unchanged. `spel_model_set_threads()` is used by the
-selftest and benchmark to switch the same loaded draft between 1 and 4 workers.
-Rows are independent dot products, so no numerical reduction crosses threads.
-Each worker handles `BLOCK = ceil(rows/(threads*6))` rows at a time with the
-existing NEON q8/ternary kernels. The serial and pooled paths produce
-bit-identical draft logits.
+`./spel verify-weights` loads the default 384d/12-layer target and the 4-layer draft, runs 16 golden tokens from a reset state, and reports max-abs logit error and argmax agreement. Pass requires target argmax 16/16 and target `max_abs < SPEL_VERIFY_TOL` (default `1e-3`). It prints actual target/draft parameter counts, FP32 sizes, and file size.
+
+For the scaled synthetic file used in this report:
 
 ```sh
-$ make selftest
-...
-[8] draft GEMV pool: threads=1 vs threads=4 bit-exact
-  draft logits: 16 x 128 floats, 0 differ (threads 1 vs 4)
-
-PASS (0 failures)
-
-$ ./spel bench
+./spel verify-weights /tmp/spel_scaled_218M_synth.bin \
+  --config d_model=1024,n_layers=16,n_heads=16,head_dim=64,d_ff=3072
 ```
 
-Three measured runs of `./spel bench` with the downloaded checkpoint produced:
-
-| path | threads | tok/s | c or alpha |
-|---|---:|---:|---|
-| AR target | — | 366.5–371.0 | 2.69–2.73 ms/token |
-| draft 4L only | 1 | 2973.8–2981.9 | c=0.12x target |
-| draft 4L only | 4 | 4394.7–4627.6 | c=0.08x target |
-| spec raw K=16 | 1 | 142.0–144.1 | alpha=0.052 |
-| spec raw K=16 | 4 | 168.7–171.0 | alpha=0.052 |
-| spec governed K=16 | 1 | 341.5–344.0 | alpha=0.094 |
-| spec governed K=16 | 4 | 356.2–361.0 | alpha=0.094 |
-
-The measured draft-only speedup from 1 to 4 workers was **1.47–1.55x**. The
-target verification cost was **v=2.69–2.72x** one AR token in both settings:
-the target path is deliberately unchanged, so the pool changes `c`, not `v`.
-Raw speculative throughput rose from `0.38–0.39x` to `0.46x` AR; governed
-throughput rose from `0.92–0.94x` to `0.97x`. The forced oracle rows remain
-threads=1 system ceilings and are reported separately below.
-
-`bench` and `demo` auto-load weights from `SPEL_WEIGHTS`, or from
-`weights/spel.bin` if that file exists in the current directory:
-
-```sh
-SPEL_WEIGHTS=weights/spel.bin ./spel bench
-./spel bench                       # auto-loads weights/spel.bin if present
-```
-
-They print `[weights] loaded <path>` at startup. `demo` switches from its
-128d/8-layer toy model to the 384d/12-layer weight configuration when a
-checkpoint is present. Bench reloads the full-copy 12-layer oracle from the same
-checkpoint, so the oracle comparison is valid rather than a random second model.
-
-## Phase 3: 100M+ runtime configuration
-
-The C runtime takes a `--config key=value,...` string or the matching
-`SPEL_D_MODEL`, `SPEL_N_LAYERS`, `SPEL_N_HEADS`, `SPEL_HEAD_DIM`, `SPEL_D_FF`,
-`SPEL_VOCAB`, `SPEL_MAX_SEQ`, `SPEL_ATTN_PERIOD`, `SPEL_SPEC_K`, and
-`SPEL_DRAFT_MAP` environment variables. Defaults are still 384/12/6/1024, so
-the existing selftests and benchmark reproduce the earlier configuration. The
-recommended scaled shape is:
-
-```text
-d_model=1024  n_layers=16  n_heads=16  head_dim=64  d_ff=3072
-vocab=128     attn_period=4  draft_map=[0,3,6,9]
-```
-
-The target is **218,436,992 parameters**, or **873,747,968 FP32 bytes
-(833.27 MiB)**. The four-layer draft is 54,543,456 parameters
-(218,173,824 bytes, 208.07 MiB). These are printed by the verifier, not
-estimated.
-
-### Scaled loader/verifier validation
-
-A real trained scaled checkpoint was **not** available in this session. To
-validate the scaled file format and runtime path without pretending to have a
-trained model, a temporary C program called `spel_save_weights` on a randomly
-initialized 1024/16 model. The resulting file is local, not committed, and
-**not trained**:
-
-```sh
-$ ./spel verify-weights /tmp/spel_scaled_218M_synth.bin \
-    --config d_model=1024,n_layers=16,n_heads=16,head_dim=64,d_ff=3072
-  config: d_model=1024 n_layers=16 n_heads=16 head_dim=64 d_ff=3072 vocab=128 max_seq=512 attn_period=4 spec_k=16 draft_map=[0,3,6,9]
-  target params: 218436992  FP32: 873747968 bytes (833.27 MiB)
-  draft params: 54543456  FP32: 218173824 bytes (208.07 MiB)
-  file: 1091938316 bytes (1041.35 MiB)
-  tolerance: 0.001
-  target: max_abs=0  argmax=16/16
-  draft : max_abs=0  argmax=16/16
-```
-
-`SPEL_VERIFY_TOL=1e-3` was used. The zero error is expected because this file's
-golden footer was generated by the same C path; it validates the loader,
-dimensions, and footer format, not Python/C numerical agreement at scale.
-
-### Scaled measured throughput (synthetic checkpoint)
-
-```sh
-$ SPEL_WEIGHTS=/tmp/spel_scaled_218M_synth.bin ./spel bench \
-    --config d_model=1024,n_layers=16,n_heads=16,head_dim=64,d_ff=3072
-```
-
-Three runs produced:
-
-| metric | measured range |
-|---|---:|
-| AR target | 29.5–29.9 tok/s (33.44–33.94 ms/token) |
-| draft 4L, threads=1 | 333.3–354.0 tok/s, c=0.08–0.09 |
-| draft 4L, threads=4 | 734.0–1000.2 tok/s, c=0.03–0.04 |
-| verify K+1=17 fast, B2 M=17 | 49.97–55.16 ms, v=1.52–1.62 |
-| verify K+1=17 fast, B3 | v=1.54–1.59 |
-| spec raw K=16, threads=1 | 9.9–10.2 tok/s (0.34x AR), alpha=0.000 |
-| spec raw K=16, threads=4 | 14.1–15.0 tok/s (0.48–0.50x AR), alpha=0.000 |
-| spec governed K=16, threads=1 | 28.2–28.9 tok/s (0.96x AR), alpha=0.000 |
-| spec governed K=16, threads=4 | 28.8–29.3 tok/s (0.97–0.98x AR), alpha=0.000 |
-| forced oracle-4L alpha=0.75, threads=1 | 130.6–134.4 tok/s (4.39–4.50x AR) |
-| forced oracle-4L alpha=1.00, threads=1 | 163.5–167.6 tok/s (5.50–5.61x AR) |
-| forced oracle-16L full copy, threads=1 | 26.0–26.4 tok/s (0.88x AR) |
-
-The synthetic random target has raw alpha=0.000, so the raw/governed rows say
-nothing about learned draft acceptance. They only show the measured system
-behavior when every proposal is rejected. The forced oracle rows are
-benchmark-only systems ceilings and are not real decoding. The target is
-DRAM-resident at this shape: measured AR fell from the 384d numbers above to
-29.5–29.9 tok/s. These numbers are for this machine and this synthetic file
-only; they are not generalized and are not a trained scaled-model result.
-
-To train and measure the real scaled checkpoint, the opt-in Colab command is:
+The file is not committed. The scaled training command, when a real checkpoint is available, is:
 
 ```sh
 python train_colab.py --d-model 1024 --n-layers 16 --n-heads 16 \
   --head-dim 64 --d-ff 3072 --out weights/spel_scaled.bin
-./spel verify-weights weights/spel_scaled.bin \
-  --config d_model=1024,n_layers=16,n_heads=16,head_dim=64,d_ff=3072
-SPEL_WEIGHTS=weights/spel_scaled.bin ./spel bench \
-  --config d_model=1024,n_layers=16,n_heads=16,head_dim=64,d_ff=3072
 ```
 
-Nothing scaled is committed: `weights/` is gitignored. The trained scaled
-verification/quality claims remain pending until that file exists.
+The 218M trained checkpoint, trained verification, and trained acceptance measurements remain pending.
 
-## Training and QAT distillation (`train_colab.py`)
-
-`train_colab.py` is a 1:1 PyTorch transliteration of `model.c`, not a generic
-transformer. It mirrors:
-
-- RMSNorm `1/sqrt(mean(x^2) + 1e-5)` and the learned gain.
-- The 3-tap causal conv used by recurrent layers:
-  `y[t] = x[t] + conv[0]*x[t-2] + conv[1]*x[t-1]`.
-- QKV layout `[q(d), k(d), v(d)]`, each split into `[heads][head_dim]`.
-- Interleaved even/odd RoPE pairs, `theta=10000`, `angle=pos*theta^(-2j/dh)`.
-- Per-head q/k L2 normalization with epsilon `1e-6`.
-- The delta-rule recurrence
-  `S_t = a*S_{t-1} + beta*(v - S_{t-1}k)k^T` and readout
-  `S_t q / sqrt(head_dim)`.
-- SwiGLU `down(silu(gate(x)) * up(x))`.
-- C's exact q8 row quantizer, 3-step ternary scale refinement, and dynamic
-  int8 activation quantizer, with straight-through estimators for QAT.
-- C round-half-away-from-zero, not PyTorch's ties-to-even `round`.
-
-The script has three stages:
-
-1. **Synthetic + structured ASCII data (`vocab=128`).** A fixed pool mixes
-   structured dialog/prose with associative NoteBank examples. Each recall
-   example plants `KEY_xx=VAL_yyyy;` in three 128-token chunks and ends with
-   `?KEY_xx=VAL_yyyy.`. The first value character after `=` cannot be copied
-   from the query prefix, so next-token training must retrieve it from context.
-2. **Target training.** Train the 12-layer FP32 target with next-token cross
-   entropy, AdamW and a cosine learning-rate schedule.
-3. **QAT distillation.** Initialize a 4-layer student from teacher layers
-   `[0, 3, 6, 9]`, tie the embedding/final norm/LM head, and train with
-   cross-entropy plus temperature-scaled KL to the frozen teacher while
-   simulating q8 weights, ternary MLP weights and dynamic int8 activations.
-4. **Export.** Write `SPELW001` with the four distilled draft layers and an
-   `SPELV001` golden footer computed by the PyTorch models. A sibling
-   `.json` file records config and validation metrics.
-
-Typical Colab invocation:
-
-```python
-!git clone https://github.com/ayush6288/spel.git
-%cd spel
-!python train_colab.py --steps-target 1200 --steps-qat 1200 \
-    --out weights/spel.bin --device auto
-!make
-!./spel verify-weights weights/spel.bin
-```
-
-Useful flags:
-
-```text
---steps-target N     target training steps (default 1200)
---steps-qat N        QAT distillation steps (default 1200)
---out PATH           output checkpoint (default weights/spel.bin)
---device auto        auto -> cuda, mps, or cpu
---d-model N          target width (default 384; C limit 1024)
---n-layers N         target depth (default 12; C limit 16)
---n-heads N          heads (default 6; C limit 16)
---head-dim N         optional check: must equal d_model // n_heads
---d-ff N             SwiGLU width (default 1024; C limit 4096)
---vocab N            token vocabulary (default 128; C limit 1024)
---attn-period N      every Nth layer is attention (default 4)
---max-seq N          context capacity (default 512; C limit 4096)
---draft-map a,b,c,d  four target layers used by the draft (default 0,3,6,9)
---batch-size N       default 8
---seq-len N          default 384
---pool-size N        default 2048 fixed synthetic sequences
---lr-target / --lr-qat
---temperature        KL temperature (default 2.0)
---kl-weight          KL loss weight (default 0.5)
---save-torch PATH    optional PyTorch state_dict export
---no-export          train/evaluate only
-```
-
-The config flags are opt-in; omitting them keeps the original 384/12/1024
-training command. `export_weights` prints the actual target parameter count and
-FP32 byte size before writing the file.
-
-A short CPU smoke run was used during development to validate export/load/QAT
-plumbing and the transliteration. It is **not** evidence of useful language
-quality or real speculative acceptance. The downloaded checkpoint used for the
-Phase 1/2 measurements above is the actual trained artifact; its training log
-and hyperparameters are not part of this repository.
-
-## Cheap-draft system oracle
-
-`./spel bench` keeps the old **full 12-layer FP32 copy** as a reference and adds
-the actual cheap draft as a system oracle:
-
-```text
-oracle-4L (a=0.75)   real 4-layer q8/ternary draft forward for pending+K
-                     proposals, real M=K+1 fast target verification,
-                     forced 75% acceptance, real position/ring rollback
-oracle-4L (a=1.00)   same, accepting all K proposals
-oracle-12L           full target-sized FP32 copy (12L default; 16L scaled)
-```
-
-The 4-layer oracle is implemented with `spel_spec_cfg.force_alpha`. The forced
-acceptance is applied **after** the real draft and target forwards, and the
-fractional carry is preserved across rounds so the requested average is hit.
-The target/ring state is really rolled back to `pos + m`. It measures the
-runtime ceiling of this draft/verifier pair; it is not a decoding benchmark and
-does not claim the draft would accept that many tokens in real generation.
-Forced rows are the median of three runs.
-
-Measured on the same M5 used for the other tables, K=16, with the downloaded
-checkpoint. The oracle rows use the threads=1 draft, unchanged from Phase 1:
-
-| path | tok/s | vs AR | real alpha |
-|---|---:|---:|---:|
-| AR target | 366.5–371.0 | 1.00x | — |
-| draft 4L only | 2973.8–2981.9 | — | — |
-| spec raw K=16 | 142.0–144.1 | 0.38–0.39x | 0.052 |
-| spec governed K=16 | 341.5–344.0 | 0.92–0.94x | 0.094 |
-| **oracle-4L a=.75** | **1016.6–1019.9** | **2.75–2.78x** | forced 0.750 |
-| **oracle-4L a=1.00** | **1274.5–1290.8** | **3.45–3.52x** | forced 1.000 |
-| oracle-12L full copy | 302.4–311.0 | 0.82–0.84x | 1.000 |
-
-The full-copy oracle is still below AR because it pays nearly one target-sized
-forward per proposal; fast verification alone cannot fix that. The 4-layer
-oracle shows the actual systems ceiling of the current cheap draft: about
-**2.75x** at 75% acceptance and **3.45x** at 100%, with the measured serial
-draft cost `c ≈ 0.12x` and verification `v ≈ 2.72x` one AR token.
-
-## Strict mode and fast mode
-
-Two arithmetic paths exist:
-
-- **Strict (default, `spel_use_accelerate = 0`).** Batched projections use the
-  explicit NEON dot-product order used by single-token AR. Batched verification
-  is bit-identical to sequential AR. All correctness tests run here.
-- **Fast (`spel_use_accelerate = 1`).** Batched projections (`M > 1`) call
-  `cblas_sgemm`, which uses Accelerate/AMX. This changes the floating-point
-  summation order. It is **token-equivalent in the tested cases, not
-  bit-identical**. On the 8-layer test model at K=16: 24/24 greedy tokens match
-  strict AR, while 248/256 logits differ in their bit patterns (argmax differs
-  at 0/4 positions).
-
-The benchmark switches to fast mode only for the verification/spec phases; its
-AR, draft-only and strict tables stay strict. There is no claim that fast mode
-preserves bit-exactness for every input.
-
-## Architecture / benchmark configuration
-
-```text
-target: d_model=384, layers=12, heads=6, head_dim=64
-        d_ff=1024, vocab=128, max_seq=512 (4096 hard cap)
-        attn_period=4 -> 9 recurrent + 3 attention layers
-        ~21.35M FP32 parameters, 85.4 MB
-draft:  4 layers [0,3,6,9], independent FP32 layer parameters
-        q8 wqkv/wo + ternary MLP after load
-        shared embedding / final norm / LM head / RoPE
-spec:   SPEL_BENCH_K=16 by default (R=17, M up to 17)
-```
-
-Each layer is `RMSNorm -> mixer -> residual -> RMSNorm -> SwiGLU MLP ->
-residual`.
-
-- **Recurrent mixer:** short causal conv (3 taps), QKV projection, L2-normalized
-  q/k, per-head decay and write rate, and the delta-rule update
-
-  ```text
-  S_t = a * S_{t-1} + beta * (v - S_{t-1} k) k^T
-  o   = S_t q / sqrt(head_dim)
-  ```
-
-  The state is `[heads][head_dim][head_dim]` per layer and is ring-buffered in
-  `spec_k+1` slots.
-- **Attention mixer:** causal RoPE attention with a conventional KV cache.
-- **Batched verification:** `spel_forward(..., M=K, ...)` or `M=K+1` computes the
-  batch in one pass. In strict mode the result is bit-identical to the same
-  number of one-token passes from the same checkpoint.
-
-## Speculative decoding
-
-A steady-state round works as follows, with a deferred correction token:
-
-1. The draft consumes the pending correction token from the previous round, then
-   proposes `K` greedy tokens.
-2. The target verifies `[pending, proposal_0, ..., proposal_{K-1}]` in one batch
-   of `K+1` tokens (the first round has no pending token and uses `K`).
-3. The longest matching prefix `m` is accepted. The next correction token is
-   `argmax(target_logits[m])`; it is emitted immediately but **not forwarded**.
-4. Rollback is a position reset. Attention KV beyond the new position is masked
-   by `pos`; the recurrent state is addressed by ring slot. The next round
-   overwrites the stale slots.
-5. The correction becomes `pending` for the next round. If generation stops with
-   a pending token, it is forwarded once at the end so the final state includes
-   every emitted token.
-
-The target's extra correction pass is gone; the draft still pays one token to
-consume the pending correction. The governor watches the rolling accepted/
-proposed ratio over `window` rounds. If it falls below `alpha_threshold`, or a
-round accepts zero proposals, drafting is suspended and the rest of the call
-runs AR. It does not resume mid-call.
-
-## Correctness invariants (`make selftest`)
-
-1. **Kernel equivalence** — 50 random matrices: dotprod/addsub/scalar return
-   identical int32 dot products; GEMV matches a dequantized reference.
-2. **Batch equivalence** — 256 logits from a 4-token batched forward are
-   bit-identical to four sequential forwards from the same checkpoint:
-   `0 differ`.
-3. **Speculative fidelity** — greedy output matches AR token-for-token:
-   `40/40` plain (K=4), `32/32` governed (K=4), `32/32` K=16, and `32/32` K=16
-   governed. A post-generation probe token produces bit-identical logits at the
-   same position in every case, including K=16 with M=17 and a 17-slot ring.
-4. **Governor** — forced threshold 1.0 trips, then emits AR rounds. K=16:
-   alpha 0.031, 29 AR rounds, 1 trip.
-5. **NoteBank** — all three planted needles are contained in retained notes;
-   summed-similarity recall@2 is 3/3. The opt-in vote ranker gets 2/3 on these
-   random weights.
-6. **Fast mode** — strict AR vs fast K=16 speculative output: 24/24 tokens
-   match; batched logits differ in 248/256 bit patterns, argmax at 0/4
-   positions. This is evidence for the tested inputs, not a bit-exactness claim.
-7. **Forced acceptance** — `force_alpha=0.75` gives 30/40 accepted proposals;
-   `force_alpha=1.00` gives 32/32. Both emit 32 tokens token-identically to AR
-   and roll back to the same final position. This is a benchmark path only.
-8. **Weights round-trip** — save target+draft as `SPELW001`, load into fresh
-   models, compare every target/draft tensor, then run the `SPELV001` verifier.
-   `max_abs=0`, 16/16 argmax.
-9. **Draft GEMV pool** — run the same 4-layer draft over the 16 golden tokens
-   with `threads=1` and `threads=4`; all 16 x 128 logits are bit-identical
-   (`0 differ`). This covers q8 `wqkv`/`wo` and ternary `w1`/`w3`/`w2`.
-
-These are same-binary, same-flags guarantees (`-O3 -ffast-math`). Bit-exactness
-across compilers, optimization levels or architectures is not claimed.
-
-## Measured results
-
-Apple M5, 10 cores, 16 GB, macOS. Single thread. `clang -O3 -mcpu=apple-m5
--ffast-math`. Ranges are across repeated runs; decode rows are representative
-single runs unless marked as medians.
-
-### Ternary GEMV vs FP32 (4096 x 1536)
-
-Values from the three Phase 2 `./spel bench` runs:
-
-| kernel | GMAC/s | packed GB/s | ms/GEMV |
-|---|---:|---:|---:|
-| neon-dotprod | 17.72–17.78 | 4.4 | 0.35–0.36 |
-| neon-addsub | 10.67–10.68 | 2.7 | 0.59 |
-| scalar | 2.51–2.52 | 0.6 | 2.50 |
-| fp32-neon | 6.20–6.61 | 24.8–26.5 | — |
-
-Packed weights are 1.50 MiB versus 24.00 MiB FP32. The dot-product kernel is
-roughly 3x the FP32 per-MAC rate on this shape.
-
-### Verification cost: strict vs fast
-
-`v` is batch time divided by one AR token (2.6–2.8 ms). M is the number of tokens
-in the target batch.
-
-| M | strict v | fast v |
-|---:|---:|---:|
-| 4 | 3.93–3.96 | 1.94–1.97 |
-| 5 | 4.82–4.88 | 1.98–2.02 |
-| 8 | 7.48–7.58 | 2.16–2.19 |
-| 9 | 8.39–8.50 | 2.21–2.26 |
-| 16 | 14.61–14.84 | 2.64–2.69 |
-| 17 | 15.54–15.74 | 2.69–2.74 |
-
-The strict path scales almost linearly with M. Accelerate amortizes the weight
-read and gives roughly a 4–6x reduction at M=17, but it is still **2.7x**, not
-1.1x. AMX is more efficient at M=16/17 than at M=4/5, which is why K=16 is the
-better speculative configuration on this machine.
-
-### Decode: 64 generated tokens, 4-layer q8/ternary draft
-
-| path | threads | K | tok/s | vs AR | notes |
-|---|---:|---:|---:|---:|---|
-| AR target | — | — | 366.5–371.0 | 1.00x | 2.69–2.73 ms/token |
-| draft 4L only | 1 | — | 2973.8–2981.9 | — | c = 0.12x target |
-| draft 4L only | 4 | — | 4394.7–4627.6 | — | c = 0.08x target |
-| spec raw | 1 | 16 | 142.0–144.1 | 0.38–0.39x | alpha 0.052, 1.83 tok/round |
-| spec raw | 4 | 16 | 168.7–171.0 | 0.46x | alpha 0.052, 1.83 tok/round |
-| spec governed | 1 | 16 | 341.5–344.0 | 0.92–0.94x | alpha 0.094, 1 trip, 59 AR rounds |
-| spec governed | 4 | 16 | 356.2–361.0 | 0.97x | alpha 0.094, 1 trip, 59 AR rounds |
-| oracle-4L a=.75 | 1 | 16 | 1016.6–1019.9 | 2.75–2.78x | forced 0.750, 12.8 tok/round |
-| oracle-4L a=1.00 | 1 | 16 | 1274.5–1290.8 | 3.45–3.52x | forced 1.000, 16.0 tok/round |
-| oracle-12L full copy | 1 | 16 | 302.4–311.0 | 0.82–0.84x | same weights, alpha 1.000 |
-
-With the downloaded checkpoint, raw K=16 accepts 29 of 560 proposals
-(alpha=0.052) and runs at 0.38–0.39x AR. The governor trips after the first
-round and falls back; it reaches 0.92–0.94x AR, so it is a safety mechanism, not
-a speedup. The forced oracle rows remain benchmark-only system ceilings: the
-draft and target forwards execute, but the accepted prefix is forced to
-`alpha*K`. They are not real decoding quality.
-
-The 12-layer full-copy oracle is retained as a reference: even at 100%
-acceptance a target-sized draft is slower than AR because it pays roughly one
-full target forward per proposal.
-
-### Cost model
-
-In steady state a round emits `1 + alpha*K` tokens on average. The draft pays
-`K+1` token forwards (the pending correction plus K proposals) and the target
-pays one `K+1` verification batch:
-
-```text
-speedup(alpha) = (1 + alpha*K) / ((K+1)*c + v_{K+1})
-```
-
-With the measured K=16 target values (`v=2.72`) and the Phase 2 draft costs:
-
-```text
-threads=1, c=0.12: alpha=.75 -> 13.0 / (17*0.12 + 2.72) = 2.69x
-threads=1, c=0.12: alpha=1.00 -> 17.0 / (17*0.12 + 2.72) = 3.51x
-threads=4, c=0.08: alpha=.75 -> 13.0 / (17*0.08 + 2.72) = 3.19x
-threads=4, c=0.08: alpha=1.00 -> 17.0 / (17*0.08 + 2.72) = 4.17x
-```
-
-The measured forced oracle at the serial draft setting is close
-(2.75–2.78x and 3.45–3.52x); the gap is draft/verify scheduling and measurement
-overhead. These projections are formulas, not measured decoding results. Real
-raw/governed throughput is alpha=0.052/0.094 as shown above.
-
-### Rollback
-
-| operation | measured |
-|---|---:|
-| position reset (commit/rollback primitive) | ~0.5 ns |
-| memcpy of 4.50 MiB KV | 108–115 us |
-| ratio | ~2.4–2.5 x 10^5 |
-
-The important property is that recurrent state is addressed by ring slot, so
-rollback never walks or copies the 4.5 MiB attention cache.
-
-### NoteBank demo
-
-| quantity | value |
-|---|---:|
-| context / chunks / notes | 384 tokens / 3 / 6 |
-| note spans | [28,52) [86,110) [158,182) [215,239) [294,318) [319,343) |
-| writer time | 0.31–0.38 ms |
-| address time (Q=4, R=2) | 0.019–0.023 ms |
-| writer needle containment | 3/3 |
-| summed-similarity recall@2 | 3/3 |
-| vote-ranker recall@2 | 2/3 |
-| note storage (toy config) | 6,720 B |
-| dense KV, all 8 layers | 3,145,728 B (468x) |
-| hybrid attention KV, 2 layers | 786,432 B (117x) |
-
-The 468x/117x ratios are for the toy 128d/8-layer demo and exclude model state
-and capture buffers. Notes are not a replacement for attention KV; replay is a
-separate path. When a 384d/12-layer checkpoint is present, `demo` uses that
-configuration and prints larger storage numbers.
-
-The demo prints a NoteBank-to-spec run (`notes 0,3 -> ... alpha=0.000 trips=1
-AR=7`). That proves the branch/replay/spec plumbing, not retrieval quality. The
-NoteBank path is still a reference implementation, not a trained memory system.
-
-## What is still missing
-
-1. **A committed trained checkpoint.** The repository does not commit the
-   checkpoint used below. `weights/spel.bin` is local and gitignored; the
-   training run log and exact hyperparameters are not included.
-2. **A real speculative speedup.** On the downloaded checkpoint, measured
-   acceptance is alpha=0.052 raw and 0.094 after the governor; raw reaches
-   0.38–0.46x AR and governed 0.92–0.97x AR. The 2.75–3.52x oracle rows are
-   forced-acceptance system ceilings, not real decoding.
-3. **Scaled trained verification evidence.** Phase 3 adds the runtime
-   configuration and validates a local random 1024/16 file through the scaled
-   loader/verifier. A scaled **trained** checkpoint must still be exported and
-   verified before any scaled quality or trained-throughput claim can be made.
-4. **A tokenizer / pretrained model.** This remains an ASCII-token research
-   harness, not a llama.cpp/GGUF integration.
-
-## Limitations
-
-- No committed trained weights; no language-model quality claim.
-- Fast mode is token-equivalent on tests, not bit-identical; strict mode remains
-  the only bit-exact path.
-- Single-threaded C inference; no persistent thread pool, GPU, or ANE path.
-- The training script uses a full-sequence PyTorch forward, not the C batched
-  verifier. C inference is bit-identical to sequential AR; PyTorch reference
-  logits match C to ~1e-5 for the target in smoke tests, not bit-for-bit.
-- `max_seq` is hard-capped at 4096; the benchmark uses 512.
-- Attention is O(T) per token with a dense KV cache; recurrent layers are O(1)
-  in context length but serial.
-- The speculative loop falls back to AR when the remaining capacity is too tight
-  for a `K+1` transient batch, and otherwise assumes `n_gen + K + 1` positions
-  fit; it does not return a partial-generation error for a too-small `max_seq`.
-- NoteBank is not a trained retrieval system; vote ranking is opt-in and loses to
-  summed similarity on random weights.
-
-## Files
+### 4.4 Files and format
 
 | file | purpose |
 |---|---|
-| `spel.h` | configuration, model, ternary/q8, NoteBank, spec and `SPELW001` APIs |
-| `ternary.c` | packing, quantization, NEON dotprod/addsub/scalar GEMV, q8 GEMV |
+| `spel.h` | configuration, model, ternary/q8, NoteBank, spec, and `SPELW001` APIs |
+| `ternary.c` | packing, q8/ternary quantization, NEON dotprod/addsub, scalar GEMV |
 | `model.c` | hybrid forward, KV/state rings, checkpoints, spec loop, governor, weights I/O |
 | `notebank.c` | chunked writer, BF16 addresses, addressing, vote/similarity ranking |
 | `main.c` | selftests, benchmarks, NoteBank/spec demo, `verify-weights` |
 | `train_colab.py` | PyTorch transliteration, synthetic data, target training, QAT distillation, export |
 | `Makefile` | build, `selftest`, `bench`, `demo`, `clean` |
+| `results/` | raw measurement captures cited in this report |
 
-The binary and object files are gitignored. Repository:
-<https://github.com/ayush6288/spel>.
+`SPELW001` is a 64-byte little-endian header followed by raw FP32 tensors and an optional `SPELV001` footer with 16 golden tokens and target/draft logits. The four draft layers hold independent distilled FP32 parameters for layers `[0,3,6,9]`; the draft shares the token embedding, final RMSNorm, LM head, and RoPE tables. On load, C quantizes each draft `wqkv`/`wo` with q8 and `w1`/`w3`/`w2` with ternary least-squares. The file keeps FP32 latents, so QAT export is lossless with respect to the C quantizers.
+
+The repository does not commit `weights/`. The trained 21M checkpoint and the synthetic 218M file are local artifacts.
+
+---
+
+**Repository:** <https://github.com/ayush6288/spel>

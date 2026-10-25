@@ -1,0 +1,43 @@
+== SPEL benchmarks ==
+[B1] ternary GEMV vs FP32 GEMV (M5, 1 thread)
+  quantize 4096x1536: 26.6 ms, packed=1.50 MiB, float=24.00 MiB
+  neon-dotprod    17.74 G MAC/s     4.4 GB/s (packed)  0.35 ms/GEMV
+  neon-addsub     10.67 G MAC/s     2.7 GB/s (packed)  0.59 ms/GEMV
+  scalar           2.52 G MAC/s     0.6 GB/s (packed)  2.50 ms/GEMV
+  fp32-neon        6.20 G MAC/s    24.8 GB/s (fp32)
+
+[B2] verification cost (d=384, 12 layers, 9 GDN + 3 attn)
+  AR token: 2.69 ms
+  M=4 strict:  10.64 ms  v=3.96x
+  M=5 strict:  12.98 ms  v=4.83x
+  M=8 strict:  20.31 ms  v=7.56x
+  M=9 strict:  22.66 ms  v=8.43x
+  M=16 strict:  39.53 ms  v=14.71x
+  M=17 strict:  41.93 ms  v=15.60x
+  M=4 fast  :   5.26 ms  v=1.96x
+  M=5 fast  :   5.40 ms  v=2.01x
+  M=8 fast  :   5.88 ms  v=2.19x
+  M=9 fast  :   6.06 ms  v=2.26x
+  M=16 fast  :   7.09 ms  v=2.64x
+  M=17 fast  :   7.28 ms  v=2.71x
+
+[B3] decode throughput (12 layers, d=384, 9 GDN + 3 attn)
+  draft: 4 of 12 layers, MLP-only ternary (2-bit), built in 25.2 ms
+[weights] loaded weights/spel.bin
+  AR target    :   369.5 tok/s  (2.71 ms/token)
+  draft 4L t=1 :  2973.8 tok/s  (0.34 ms/token, c=0.12x target)
+  draft 4L t=4 :  4572.4 tok/s  (0.22 ms/token, c=0.08x target)
+  verify K+1=17 :   7.36 ms  v=2.72x AR token  (fast mode, target path)
+  spec K=16 raw t=1:   142.0 tok/s  (0.38x AR)  alpha=0.052  c=0.12  v=2.72  (1.83 tok/round)
+  spec K=16 raw t=4:   169.4 tok/s  (0.46x AR)  alpha=0.052  c=0.08  v=2.72  (1.83 tok/round)
+  spec K=16 gov t=1:   344.0 tok/s  (0.93x AR)  alpha=0.094  c=0.12  v=2.72  trips=1 AR-rounds=59
+  spec K=16 gov t=4:   358.4 tok/s  (0.97x AR)  alpha=0.094  c=0.08  v=2.72  trips=1 AR-rounds=59
+  spec oracle-4L (alpha=0.75):  1016.6 tok/s  (2.75x AR)  alpha=0.750  (12.80 tok/round)
+  spec oracle-4L (alpha=1.00):  1274.5 tok/s  (3.45x AR)  alpha=1.000  (16.00 tok/round)
+  projected t=1: a=.75 2.69x  a=1.00 3.52x  (K=16, c=0.12, v=2.72)
+  projected t=4: a=.75 3.18x  a=1.00 4.15x  (K=16, c=0.08, v=2.72)
+  raw t=1 rounds=35 proposed=560 accepted=29
+  raw t=4 rounds=35 proposed=560 accepted=29
+  spec oracle-12L (full copy):   311.0 tok/s  (0.84x AR)  alpha=1.000  (16.00 tok/round)
+  rollback     : pos reset ~0.5 ns, KV copy 108.2 us (4.50 MiB), 239962x
+  (commit moves a pointer; accepted KV stays in place)

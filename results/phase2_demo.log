@@ -1,0 +1,22 @@
+== SPEL demo: NoteBank + SubTernary on Apple M5 ==
+[4] NoteBank writer / addressing / replay
+[weights] loaded weights/spel.bin
+  chunks=3 notes=6 write=1.64 ms
+  note spans: [28,52) [0,24) [164,188) [136,160) [294,318) [342,366)
+  writer needle 0 @40 -> note 0 ok
+  writer needle 1 @170 -> note 2 ok
+  writer needle 2 @300 -> note 4 ok
+  address needle 0 -> notes 2,0,-1,-1  hit=1  0.046 ms
+      value rank: no-replay=117 replay=117 (V=128)
+  address needle 1 -> notes 2,4,-1,-1  hit=1  0.045 ms
+      value rank: no-replay=79 replay=79 (V=128)
+  address needle 2 -> notes 4,2,-1,-1  hit=1  0.046 ms
+      value rank: no-replay=49 replay=49 (V=128)
+  votes needle 0 -> notes 2,1  hit=0
+  votes needle 1 -> notes 2,4  hit=1
+  votes needle 2 -> notes 4,1  hit=1
+  vote recall: 2/3 (similarity ranking remains default)
+  NoteBank->spec: notes 2,0 -> 21 107 32 119 97 105 116 115  alpha=0.000 trips=1 AR=7
+  storage: notes=14400 B  dense-KV=14155776 B (983x)  hybrid-KV=3538944 B (245.8x)
+
+  48-token spec run: 48/48 tokens match AR, alpha=0.036, 1.14 tok/round

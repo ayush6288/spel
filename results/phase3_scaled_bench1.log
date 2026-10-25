@@ -1,0 +1,44 @@
+== SPEL benchmarks ==
+  config: d_model=1024 n_layers=16 n_heads=16 head_dim=64 d_ff=3072 vocab=128 max_seq=512 attn_period=4 spec_k=16 draft_map=[0,3,6,9]
+[B1] ternary GEMV vs FP32 GEMV (M5, 1 thread)
+  quantize 4096x1536: 26.7 ms, packed=1.50 MiB, float=24.00 MiB
+  neon-dotprod    17.83 G MAC/s     4.5 GB/s (packed)  0.35 ms/GEMV
+  neon-addsub     10.69 G MAC/s     2.7 GB/s (packed)  0.59 ms/GEMV
+  scalar           2.51 G MAC/s     0.6 GB/s (packed)  2.50 ms/GEMV
+  fp32-neon        6.67 G MAC/s    26.7 GB/s (fp32)
+
+[B2] verification cost (d=1024, 16 layers, 12 GDN + 4 attn)
+  AR token: 32.87 ms
+  M=4 strict: 132.26 ms  v=4.02x
+  M=5 strict: 164.15 ms  v=4.99x
+  M=8 strict: 260.10 ms  v=7.91x
+  M=9 strict: 292.29 ms  v=8.89x
+  M=16 strict: 516.10 ms  v=15.70x
+  M=17 strict: 548.55 ms  v=16.69x
+  M=4 fast  :  42.81 ms  v=1.30x
+  M=5 fast  :  43.88 ms  v=1.33x
+  M=8 fast  :  45.06 ms  v=1.37x
+  M=9 fast  :  47.04 ms  v=1.43x
+  M=16 fast  :  49.06 ms  v=1.49x
+  M=17 fast  :  49.97 ms  v=1.52x
+
+[B3] decode throughput (16 layers, d=1024, 12 GDN + 4 attn, K=16)
+  draft: 4 of 16 layers, MLP-only ternary (2-bit), built in 240.6 ms
+[weights] loaded /tmp/spel_scaled_218M_synth.bin
+  AR target    :    29.9 tok/s  (33.44 ms/token)
+  draft 4L t=1 :   333.3 tok/s  (3.00 ms/token, c=0.09x target)
+  draft 4L t=4 :  1000.2 tok/s  (1.00 ms/token, c=0.03x target)
+  verify K+1=17 :  51.47 ms  v=1.54x AR token  (fast mode, target path)
+  spec K=16 raw t=1:    10.2 tok/s  (0.34x AR)  alpha=0.000  c=0.09  v=1.54  (1.00 tok/round)
+  spec K=16 raw t=4:    15.0 tok/s  (0.50x AR)  alpha=0.000  c=0.03  v=1.54  (1.00 tok/round)
+  spec K=16 gov t=1:    28.9 tok/s  (0.96x AR)  alpha=0.000  c=0.09  v=1.54  trips=1 AR-rounds=63
+  spec K=16 gov t=4:    29.3 tok/s  (0.98x AR)  alpha=0.000  c=0.03  v=1.54  trips=1 AR-rounds=63
+  spec oracle-4L (alpha=0.75):   134.4 tok/s  (4.50x AR)  alpha=0.750  (12.80 tok/round)
+  spec oracle-4L (alpha=1.00):   167.6 tok/s  (5.61x AR)  alpha=1.000  (16.00 tok/round)
+  projected t=1: a=.75 4.24x  a=1.00 5.55x  (K=16, c=0.09, v=1.54)
+  projected t=4: a=.75 6.35x  a=1.00 8.30x  (K=16, c=0.03, v=1.54)
+  raw t=1 rounds=64 proposed=1024 accepted=0
+  raw t=4 rounds=64 proposed=1024 accepted=0
+  spec oracle-16L (full copy):    26.4 tok/s  (0.88x AR)  alpha=1.000  (16.00 tok/round)
+  rollback     : pos reset ~0.5 ns, KV copy 467.9 us (16.00 MiB), 1037955x
+  (commit moves a pointer; accepted KV stays in place)
