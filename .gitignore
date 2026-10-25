@@ -1,0 +1,6 @@
+spel
+*.o
+.DS_Store
+results/
+.venv/
+*.dSYM/

@@ -1,0 +1,199 @@
+/* spel.h — hybrid linear-attention toy model + ternary GEMV + speculative runtime.
+ *
+ * This is a self-contained research harness, not a wrapper around llama.cpp.
+ * Everything here is deterministic and testable on a laptop:
+ *   - ternary {-1,0,+1} packing, NEON dotprod and add/sub GEMV kernels
+ *   - hybrid model: Gated-DeltaNet-style recurrent layers + RoPE attention
+ *   - O(1) transactional commit/rollback for KV cache and recurrent state
+ *   - NoteBank-style chunked writer, address matching, replay demo
+ *   - greedy speculative decoding that must be bit-identical to AR decoding
+ */
+#ifndef SPEL_H
+#define SPEL_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#define SPEL_MAX_LAYERS   16
+#define SPEL_MAX_HEADS    16
+#define SPEL_MAX_D        512
+#define SPEL_MAX_DFF      1536
+#define SPEL_MAX_SEQ      4096
+#define SPEL_MAX_VOCAB    1024
+#define SPEL_MAX_BATCH    8
+#define SPEL_MAX_CHANNELS (SPEL_MAX_LAYERS * SPEL_MAX_HEADS)
+#define SPEL_XH_RING      16
+#define SPEL_ROPE_THETA   10000.0f
+
+/* ------------------------------------------------------------------ cfg */
+
+typedef struct {
+    int d_model, n_layers, n_heads, head_dim, d_ff, vocab, max_seq;
+    int attn_period;                 /* every attn_period-th layer is attention */
+    int conv_k;                      /* short conv taps in recurrent layers */
+    int spec_k;                      /* speculative depth K */
+    int n_linear, n_attn, n_channels;/* n_channels = n_linear * n_heads */
+    int is_linear[SPEL_MAX_LAYERS];
+    int lin_index[SPEL_MAX_LAYERS];  /* -1 for attention layers */
+    int attn_index[SPEL_MAX_LAYERS];
+} spel_cfg;
+
+int  spel_cfg_init(spel_cfg *c, int d, int layers, int heads, int dff,
+                   int vocab, int max_seq, int attn_period, int spec_k);
+int  spel_cfg_validate(const spel_cfg *c);
+
+/* ------------------------------------------------------------- ternary */
+
+typedef struct {
+    uint8_t *packed;   /* nrows * packed_stride bytes */
+    float   *scale;    /* nrows */
+    int      nrows, ncols, packed_stride;
+} tern_mat;
+
+size_t tern_packed_stride(int ncols);
+int    tern_mat_init(tern_mat *m, int nrows, int ncols);
+void   tern_mat_free(tern_mat *m);
+void   tern_quantize_row(const float *w, int ncols, uint8_t *packed, float *scale);
+void   tern_quantize_mat(tern_mat *m, const float *w); /* w row-major [nrows][ncols] */
+void   tern_dequant_row(const uint8_t *packed, float scale, int ncols, float *out);
+int32_t tern_dot_i8(const uint8_t *packed, const int8_t *x, int ncols);
+void   tern_gemv(const tern_mat *m, const float *x, float *y);
+/* Kernel selection: 0 = auto (dotprod if available), 1 = add/sub, 2 = scalar */
+extern int tern_kernel_mode;
+const char *tern_kernel_name(void);
+
+/* --------------------------------------------------------------- model */
+
+typedef struct {
+    float *wqkv;   /* [3d][d] */
+    float *wo;     /* [d][d]  */
+    float *w1;     /* [dff][d] */
+    float *w3;     /* [dff][d] */
+    float *w2;     /* [d][dff] */
+    float *conv;   /* [conv_k][d] (linear only) */
+    float *wa, *wb;/* [heads] (linear only) */
+    float *n1, *n2;
+    tern_mat t1, t2, t3;  /* optional ternary MLP (draft) */
+} spel_layer;
+
+typedef struct {
+    spel_cfg cfg;
+    int owns_params;
+    float *params;
+    size_t n_params;
+    float *emb, *wout, *normf;      /* [vocab][d], [vocab][d], [d] */
+    float *rope_cos, *rope_sin;     /* [max_seq][dh/2] */
+    spel_layer layer[SPEL_MAX_LAYERS];
+
+    /* runtime state (per model instance) */
+    float *kv_k[SPEL_MAX_LAYERS], *kv_v[SPEL_MAX_LAYERS];
+    float *S[SPEL_MAX_LAYERS];      /* (K+1) * heads * dh * dh */
+    float *xh[SPEL_MAX_LAYERS];     /* SPEL_XH_RING * d */
+    float *buf;                     /* forward scratch */
+    size_t buf_floats;
+    float *last_logits;             /* [vocab] */
+    int pos;                        /* number of tokens processed */
+    int is_ternary;
+
+    /* optional activation capture for NoteBank (linear layers only) */
+    float *cap_q, *cap_k;
+    int cap_enabled;
+    int cap_len;                    /* allocated positions */
+    uint64_t rng;
+} spel_model;
+
+spel_model *spel_model_new(const spel_cfg *cfg, uint64_t seed);
+spel_model *spel_model_new_draft(const spel_model *target);
+void        spel_model_free(spel_model *m);
+void        spel_model_reset(spel_model *m);
+
+/* Capture buffers are indexed by absolute position: [pos][channel][dh]. */
+int  spel_capture_alloc(spel_model *m, int max_pos);
+void spel_capture_free(spel_model *m);
+
+/* Forward M contiguous tokens starting at m->pos. logits may be NULL. */
+void spel_forward(spel_model *m, const int *tokens, int M, float *logits);
+int  spel_argmax(const float *v, int n);
+
+/* -------------------------------------------------------- checkpoints */
+
+typedef struct spel_ckpt spel_ckpt;
+spel_ckpt *spel_ckpt_new(const spel_model *m);
+void       spel_ckpt_save(spel_ckpt *c, const spel_model *m);
+void       spel_ckpt_load(spel_model *m, const spel_ckpt *c);
+void       spel_ckpt_free(spel_ckpt *c);
+
+/* ----------------------------------------------------------- note bank */
+
+#define NB_MAX_NOTES 96
+
+typedef struct {
+    int chunk;
+    int start;         /* token start in source context */
+    int n_tokens;
+    int *tokens;
+    int used;
+} nb_note;
+
+typedef struct {
+    int chunk;         /* tokens per chunk (paper: 512) */
+    int window;        /* scorer window (paper: 48) */
+    int budget;        /* span budget  (paper: 64) */
+    int per_chunk;     /* notes per chunk (paper: 2) */
+    int addr_dim;      /* 16 */
+    int n_notes;
+    int n_channels, dh;
+    int *proj_idx;     /* [n_channels][addr_dim] coordinates */
+    uint16_t *rho;     /* [n_notes][n_channels][addr_dim] bf16 */
+    nb_note notes[NB_MAX_NOTES];
+    uint64_t seed;
+} nb_bank;
+
+void nb_bank_init(nb_bank *b, const spel_cfg *cfg, int chunk, int window,
+                  int budget, int per_chunk, int addr_dim, uint64_t seed);
+void nb_bank_free(nb_bank *b);
+/* cap_k/cap_q must be populated by a capture-enabled prefill over ctx. */
+int  nb_write(nb_bank *b, const spel_cfg *cfg, const int *ctx, int T,
+              const float *cap_k, const float *cap_q);
+/* cap_q at absolute positions [q_base, q_base+Q). Returns notes selected. */
+int  nb_address(const nb_bank *b, const spel_cfg *cfg, int Q, const float *cap_q,
+                int q_base, int R, int *sel);
+void nb_bf16(float f, uint16_t *out);
+float nb_bf16_to_f(uint16_t v);
+
+/* ------------------------------------------------------ speculative run */
+
+typedef struct {
+    int K;
+    int governor;          /* enable dynamic governor */
+    double alpha_threshold;/* default 0.30 */
+    int window;            /* acceptance rolling window */
+} spel_spec_cfg;
+
+typedef struct {
+    long rounds, proposed, accepted, emitted, corr;
+    long ar_rounds, spec_rounds, governor_trips;
+    double alpha;          /* accepted / proposed */
+    double tokens_per_round;
+} spel_spec_stats;
+
+void spel_spec_cfg_default(spel_spec_cfg *s, int K);
+/* Both models must be at the same pos and hold last_logits for that pos. */
+void spel_spec_generate(spel_model *target, spel_model *draft,
+                        int n_gen, int *out, const spel_spec_cfg *sc,
+                        spel_spec_stats *st);
+
+/* ------------------------------------------------------------- utils */
+
+uint64_t spel_rng_next(uint64_t *s);
+double   spel_rng_double(uint64_t *s);
+float    spel_rng_normal(uint64_t *s);
+double   spel_now_ms(void);
+size_t   spel_kv_bytes(const spel_cfg *c);
+size_t   spel_note_bytes(const nb_bank *b);
+
+#endif

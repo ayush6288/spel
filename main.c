@@ -1,0 +1,517 @@
+/* main.c — selftests, kernel/decoder benchmarks, NoteBank demo. */
+#include "spel.h"
+#include <arm_neon.h>
+#include <time.h>
+
+static int failures = 0;
+#define CHECK(cond, ...) do { \
+    if (!(cond)) { failures++; printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); } \
+} while (0)
+
+static void fill_tokens(int *t, int n, int vocab, uint64_t *rng) {
+    for (int i = 0; i < n; i++) t[i] = (int)(spel_rng_next(rng) % (uint64_t)vocab);
+}
+
+static float frand(uint64_t *rng) { return (float)(spel_rng_double(rng) * 2.0 - 1.0); }
+
+static uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+
+/* --------------------------------------------------------- ternary test */
+
+static void test_ternary(void) {
+    printf("[1] ternary pack / dot / GEMV\n");
+    uint64_t rng = 0x1234;
+    for (int trial = 0; trial < 50; trial++) {
+        int nrows = 1 + (int)(spel_rng_next(&rng) % 8);
+        int ncols = 1 + (int)(spel_rng_next(&rng) % 200);
+        float *W = (float *)malloc((size_t)nrows * ncols * sizeof(float));
+        float *x = (float *)malloc((size_t)ncols * sizeof(float));
+        float *y = (float *)malloc((size_t)nrows * sizeof(float));
+        tern_mat tm; tern_mat_init(&tm, nrows, ncols);
+        for (int i = 0; i < nrows * ncols; i++) W[i] = frand(&rng) * (i % 7 == 0 ? 0.0f : 1.0f);
+        for (int i = 0; i < ncols; i++) x[i] = frand(&rng) * 3.0f;
+        tern_quantize_mat(&tm, W);
+        tern_gemv(&tm, x, y);
+        float xmax = 0.0f;
+        for (int i = 0; i < ncols; i++) xmax = fmaxf(xmax, fabsf(x[i]));
+        float xs = xmax / 127.0f; if (xs < 1e-12f) xs = 1e-12f;
+        int8_t xq[512];
+        for (int i = 0; i < ncols; i++) xq[i] = (int8_t)roundf(x[i] / xs);
+        for (int r = 0; r < nrows; r++) {
+            float *deq = (float *)malloc((size_t)ncols * sizeof(float));
+            tern_dequant_row(tm.packed + (size_t)r * tm.packed_stride, tm.scale[r], ncols, deq);
+            double ref = 0.0;
+            for (int i = 0; i < ncols; i++) ref += (double)deq[i] * ((double)xq[i] * xs);
+            CHECK(fabs((double)y[r] - ref) <= 1e-5 * (1.0 + fabs(ref)),
+                  "gemv r=%d y=%.6f ref=%.6f", r, y[r], ref);
+            free(deq);
+        }
+        /* integer kernels must agree exactly */
+        for (int i = 0; i < ncols; i++) xq[i] = (int8_t)((int)(spel_rng_next(&rng) % 255) - 127);
+        for (int r = 0; r < nrows; r++) {
+            const uint8_t *p = tm.packed + (size_t)r * tm.packed_stride;
+            int save = tern_kernel_mode;
+            tern_kernel_mode = 2; int32_t a = tern_dot_i8(p, xq, ncols);
+            tern_kernel_mode = 1; int32_t b = tern_dot_i8(p, xq, ncols);
+            tern_kernel_mode = 0; int32_t c = tern_dot_i8(p, xq, ncols);
+            tern_kernel_mode = save;
+            CHECK(a == b && b == c, "kernel mismatch scalar=%d addsub=%d dot=%d", a, b, c);
+        }
+        tern_mat_free(&tm);
+        free(W); free(x); free(y);
+    }
+    printf("  kernels: %s (dotprod/addsub/scalar agree)\n", tern_kernel_name());
+}
+
+/* ------------------------------------------------------ model bit tests */
+
+static void test_batch_equiv(void) {
+    printf("[2] batched verification == sequential AR (bitwise)\n");
+    spel_cfg c;
+    spel_cfg_init(&c, 128, 8, 4, 256, 64, 256, 4, 4);
+    spel_model *m = spel_model_new(&c, 77);
+    uint64_t rng = 9;
+    int toks[32]; fill_tokens(toks, 32, c.vocab, &rng);
+    for (int i = 0; i < 20; i++) spel_forward(m, &toks[i], 1, NULL);
+    spel_ckpt *cp = spel_ckpt_new(m);
+    float a[4 * 64], b[4 * 64];
+    spel_forward(m, toks + 20, 4, a);
+    spel_ckpt_load(m, cp);
+    for (int i = 0; i < 4; i++) spel_forward(m, &toks[20 + i], 1, b + i * c.vocab);
+    int diff = 0;
+    for (int i = 0; i < 4 * c.vocab; i++) if (fbits(a[i]) != fbits(b[i])) diff++;
+    CHECK(diff == 0, "%d/%d logits differ", diff, 4 * c.vocab);
+    printf("  %d logits compared, %d differ\n", 4 * c.vocab, diff);
+    spel_ckpt_free(cp);
+    spel_model_free(m);
+}
+
+/* -------------------------------------------------------- spec decoding */
+
+typedef struct {
+    int matched;
+    float probe_diff_bits;
+    spel_spec_stats st;
+    int n;
+} spec_result;
+
+static void run_spec_case(int d, int layers, int dff, int vocab, int max_seq,
+                          int prompt_n, int gen_n, uint64_t seed, int governor,
+                          double threshold, spec_result *res) {
+    spel_cfg c;
+    spel_cfg_init(&c, d, layers, 4, dff, vocab, max_seq, 4, 4);
+    spel_model *target = spel_model_new(&c, seed);
+    spel_model *draft = spel_model_new_draft(target);
+    uint64_t rng = seed ^ 0xDEADBEEF;
+    int prompt[128];
+    fill_tokens(prompt, prompt_n, vocab, &rng);
+
+    spel_model_reset(target); spel_model_reset(draft);
+    for (int i = 0; i < prompt_n; i += 4) {
+        int n = prompt_n - i < 4 ? prompt_n - i : 4;
+        spel_forward(target, prompt + i, n, NULL);
+        spel_forward(draft, prompt + i, n, NULL);
+    }
+    spel_ckpt *cp_t = spel_ckpt_new(target);
+    spel_ckpt *cp_d = spel_ckpt_new(draft);
+
+    int *ar = (int *)malloc((size_t)gen_n * sizeof(int));
+    int *sp = (int *)malloc((size_t)gen_n * sizeof(int));
+    for (int i = 0; i < gen_n; i++) {
+        int t = spel_argmax(target->last_logits, vocab);
+        ar[i] = t;
+        spel_forward(target, &t, 1, NULL);
+    }
+    int probe = (int)(rng % (uint64_t)vocab);
+    spel_forward(target, &probe, 1, NULL);
+    float ar_probe[SPEL_MAX_VOCAB];
+    memcpy(ar_probe, target->last_logits, (size_t)vocab * sizeof(float));
+    int ar_pos = target->pos;
+
+    spel_ckpt_load(target, cp_t);
+    spel_ckpt_load(draft, cp_d);
+    spel_spec_cfg sc; spel_spec_cfg_default(&sc, 4);
+    sc.governor = governor; sc.alpha_threshold = threshold;
+    spel_spec_stats st;
+    spel_spec_generate(target, draft, gen_n, sp, &sc, &st);
+    spel_forward(target, &probe, 1, NULL);
+    float sp_probe[SPEL_MAX_VOCAB];
+    memcpy(sp_probe, target->last_logits, (size_t)vocab * sizeof(float));
+    int sp_pos = target->pos;
+
+    int match = 0;
+    for (int i = 0; i < gen_n; i++) if (ar[i] == sp[i]) match++;
+    int pd = 0;
+    for (int i = 0; i < vocab; i++) if (fbits(ar_probe[i]) != fbits(sp_probe[i])) pd++;
+
+    res->matched = match;
+    res->probe_diff_bits = (float)pd;
+    res->st = st;
+    res->n = gen_n;
+    CHECK(match == gen_n, "token mismatch %d/%d", match, gen_n);
+    CHECK(pd == 0, "post-generation state probe differs in %d/%d logits (pos %d vs %d)",
+          pd, vocab, ar_pos, sp_pos);
+    CHECK(ar_pos == sp_pos, "final pos differs");
+
+    free(ar); free(sp);
+    spel_ckpt_free(cp_t); spel_ckpt_free(cp_d);
+    spel_model_free(target); spel_model_free(draft);
+}
+
+static void test_spec(void) {
+    printf("[3] speculative decode: exact greedy fidelity + rollback\n");
+    spec_result r;
+    run_spec_case(128, 8, 256, 64, 256, 24, 40, 12345, 0, 0.0, &r);
+    printf("  plain:   %d/%d tokens match, alpha=%.3f, trips=%ld\n",
+           r.matched, r.n, r.st.alpha, r.st.governor_trips);
+    CHECK(r.st.alpha >= 0.0 && r.st.alpha <= 1.0, "bad alpha");
+
+    run_spec_case(128, 8, 256, 64, 256, 24, 32, 999, 1, 1.0, &r);
+    printf("  governor: %d/%d match, alpha=%.3f, AR rounds=%ld, trips=%ld\n",
+           r.matched, r.n, r.st.alpha, r.st.ar_rounds, r.st.governor_trips);
+    CHECK(r.st.governor_trips > 0, "governor never tripped at threshold 1.0");
+    CHECK(r.st.ar_rounds > 0, "governor emitted no AR fallback rounds");
+}
+
+/* ------------------------------------------------------------- notebank */
+
+static int note_contains(const nb_bank *b, int pos) {
+    for (int i = 0; i < b->n_notes; i++) {
+        if (pos >= b->notes[i].start && pos < b->notes[i].start + b->notes[i].n_tokens)
+            return i;
+    }
+    return -1;
+}
+
+static int rank_of(const float *logits, int V, int tok) {
+    int r = 0;
+    for (int i = 0; i < V; i++) if (logits[i] > logits[tok]) r++;
+    return r;
+}
+
+static void test_notebank(void) {
+    printf("[4] NoteBank writer / addressing / replay\n");
+    spel_cfg c;
+    spel_cfg_init(&c, 128, 8, 4, 256, 128, 512, 4, 4);
+    spel_model *m = spel_model_new(&c, 2024);
+    spel_model_reset(m);
+    spel_capture_alloc(m, c.max_seq);
+
+    const int T = 384, C = 128, N_NEEDLE = 3;
+    int *ctx = (int *)malloc((size_t)T * sizeof(int));
+    uint64_t rng = 4242;
+    for (int i = 0; i < T; i++) ctx[i] = 1 + (int)(spel_rng_next(&rng) % 8);
+    int needles[3] = {40, 170, 300};
+    int keys[3] = {100, 102, 104};
+    int vals[3] = {80, 81, 82};
+    for (int i = 0; i < N_NEEDLE; i++) {
+        int p = needles[i];
+        ctx[p + 0] = keys[i];
+        ctx[p + 1] = vals[i];
+        ctx[p + 2] = keys[i] + 1;
+        ctx[p + 3] = vals[i] + 1;
+        ctx[p + 4] = keys[i] + 2;
+        ctx[p + 5] = vals[i] + 2;
+    }
+    m->cap_enabled = 1;
+    for (int i = 0; i < T; i += 4) spel_forward(m, ctx + i, 4, NULL);
+    m->cap_enabled = 0;
+
+    nb_bank bank;
+    nb_bank_init(&bank, &c, C, 12, 24, 2, 16, 777);
+    double t0 = spel_now_ms();
+    nb_write(&bank, &c, ctx, T, m->cap_k, m->cap_q);
+    double tw = spel_now_ms() - t0;
+    printf("  chunks=%d notes=%d write=%.2f ms\n", (T + C - 1) / C, bank.n_notes, tw);
+    printf("  note spans:");
+    for (int i = 0; i < bank.n_notes; i++) printf(" [%d,%d)", bank.notes[i].start,
+                                                  bank.notes[i].start + bank.notes[i].n_tokens);
+    printf("\n");
+
+    for (int i = 0; i < N_NEEDLE; i++) {
+        int ni = note_contains(&bank, needles[i]);
+        CHECK(ni >= 0, "writer missed needle %d at %d", i, needles[i]);
+        printf("  writer needle %d @%d -> note %d %s\n", i, needles[i], ni, ni >= 0 ? "ok" : "MISS");
+    }
+
+    spel_ckpt *cp = spel_ckpt_new(m);
+    int sel[4];
+    for (int i = 0; i < N_NEEDLE; i++) {
+        spel_ckpt_load(m, cp);
+        int q[4] = {keys[i], keys[i] + 1, keys[i] + 2, 127};
+        m->cap_enabled = 1;
+        spel_forward(m, q, 4, NULL);
+        m->cap_enabled = 0;
+        double ta = spel_now_ms();
+        int ns = nb_address(&bank, &c, 4, m->cap_q, T, 2, sel);
+        ta = spel_now_ms() - ta;
+        int hit = 0;
+        for (int j = 0; j < ns; j++)
+            if (note_contains(&bank, needles[i]) == sel[j]) hit = 1;
+        CHECK(hit, "address missed needle %d (selected %d,%d)", i,
+              ns > 0 ? sel[0] : -1, ns > 1 ? sel[1] : -1);
+        printf("  address needle %d -> notes %d,%d,%d,%d  hit=%d  %.3f ms\n", i,
+               ns > 0 ? sel[0] : -1, ns > 1 ? sel[1] : -1,
+               ns > 2 ? sel[2] : -1, ns > 3 ? sel[3] : -1, hit, ta);
+
+        /* replay vs no replay: rank of the planted value token */
+        spel_ckpt_load(m, cp);
+        spel_forward(m, q, 4, NULL);
+        int rank_no = rank_of(m->last_logits, c.vocab, vals[i]);
+        spel_ckpt_load(m, cp);
+        for (int j = 0; j < ns; j++) {
+            nb_note *n = &bank.notes[sel[j]];
+            spel_forward(m, n->tokens, n->n_tokens, NULL);
+        }
+        spel_forward(m, q, 4, NULL);
+        int rank_yes = rank_of(m->last_logits, c.vocab, vals[i]);
+        printf("      value rank: no-replay=%d replay=%d (V=%d)\n", rank_no, rank_yes, c.vocab);
+    }
+
+    size_t nb_bytes = spel_note_bytes(&bank);
+    size_t dense = 2 * (size_t)c.n_layers * T * c.d_model * 4;
+    size_t actual = 2 * (size_t)c.n_attn * T * c.d_model * 4;
+    printf("  storage: notes=%zu B  dense-KV=%zu B (%.0fx)  hybrid-KV=%zu B (%.1fx)\n",
+           nb_bytes, dense, (double)dense / (double)nb_bytes,
+           actual, (double)actual / (double)nb_bytes);
+    CHECK(nb_bytes > 0, "empty notes");
+
+    nb_bank_free(&bank);
+    free(ctx);
+    spel_ckpt_free(cp);
+    spel_capture_free(m);
+    spel_model_free(m);
+}
+
+/* ------------------------------------------------------------- benches */
+
+static float dot_f32(const float *a, const float *b, int n) {
+    float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        s0 = vfmaq_f32(s0, vld1q_f32(a + i), vld1q_f32(b + i));
+        s1 = vfmaq_f32(s1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    }
+    float s = vaddvq_f32(vaddq_f32(s0, s1));
+    for (; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+static void bench_ternary(void) {
+    printf("[B1] ternary GEMV vs FP32 GEMV (M5, 1 thread)\n");
+    const int N = 4096, K = 1536;
+    float *W = (float *)malloc((size_t)N * K * sizeof(float));
+    float *x = (float *)malloc((size_t)K * sizeof(float));
+    float *y = (float *)malloc((size_t)N * sizeof(float));
+    uint64_t rng = 55;
+    for (int i = 0; i < N * K; i++) W[i] = frand(&rng) * (i % 11 == 0 ? 0.0f : 1.0f);
+    for (int i = 0; i < K; i++) x[i] = frand(&rng);
+    tern_mat tm; tern_mat_init(&tm, N, K);
+    double tq = spel_now_ms();
+    tern_quantize_mat(&tm, W);
+    tq = spel_now_ms() - tq;
+    printf("  quantize %dx%d: %.1f ms, packed=%.2f MiB, float=%.2f MiB\n",
+           N, K, tq, (double)N * tm.packed_stride / 1048576.0,
+           (double)N * K * 4 / 1048576.0);
+
+    int iters = 200;
+    for (int mode = 0; mode < 3; mode++) {
+        tern_kernel_mode = mode;
+        tern_gemv(&tm, x, y);
+        double t0 = spel_now_ms();
+        for (int it = 0; it < iters; it++) tern_gemv(&tm, x, y);
+        double dt = (spel_now_ms() - t0) / 1000.0;
+        double bytes = (double)N * tm.packed_stride * iters;
+        double macs = (double)N * K * iters;
+        printf("  %-13s %7.2f G MAC/s  %6.1f GB/s (packed)  %.2f ms/GEMV\n",
+               mode == 0 ? "neon-dotprod" : mode == 1 ? "neon-addsub" : "scalar",
+               macs / dt / 1e9, bytes / dt / 1e9, dt * 1000.0 / iters);
+    }
+    tern_kernel_mode = 0;
+
+    /* FP32 baseline, same shape */
+    double t0 = spel_now_ms();
+    for (int it = 0; it < 20; it++) {
+        for (int r = 0; r < N; r++) y[r] = dot_f32(W + (size_t)r * K, x, K);
+    }
+    double dt = (spel_now_ms() - t0) / 1000.0;
+    printf("  %-13s %7.2f G MAC/s  %6.1f GB/s (fp32)\n",
+           "fp32-neon", (double)N * K * 20 / dt / 1e9,
+           (double)N * K * 4 * 20 / dt / 1e9);
+
+    tern_mat_free(&tm);
+    free(W); free(x); free(y);
+}
+
+static void bench_decode(void) {
+    printf("[B2] decode throughput (12 layers, d=384, 9 GDN + 3 attn, 85 MB weights)\n");
+    spel_cfg c;
+    spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, 4);
+    spel_model *target = spel_model_new(&c, 31337);
+    double tq = spel_now_ms();
+    spel_model *draft = spel_model_new_draft(target);
+    tq = spel_now_ms() - tq;
+    if (!draft) { printf("  draft alloc failed\n"); spel_model_free(target); return; }
+    printf("  draft: MLP-only ternary (2-bit), built in %.1f ms\n", tq);
+
+    uint64_t rng = 8;
+    int prompt[64];
+    fill_tokens(prompt, 64, c.vocab, &rng);
+    const int gen = 64;
+    int *out = (int *)malloc((size_t)gen * sizeof(int));
+    double ar_ms, dr_ms, sp_ms, gov_ms;
+    spel_spec_stats st, st_gov, st_or;
+    spel_spec_cfg sc; spel_spec_cfg_default(&sc, 4);
+
+    /* AR target */
+    spel_model_reset(target);
+    spel_forward(target, prompt, 64, NULL);
+    for (int i = 0; i < 8; i++) {
+        int t = spel_argmax(target->last_logits, c.vocab);
+        spel_forward(target, &t, 1, NULL);
+    }
+    double t0 = spel_now_ms();
+    for (int i = 0; i < gen; i++) {
+        int t = spel_argmax(target->last_logits, c.vocab);
+        spel_forward(target, &t, 1, NULL);
+    }
+    ar_ms = spel_now_ms() - t0;
+
+    /* draft-only (same architecture, ternary MLP) */
+    spel_model_reset(draft);
+    spel_forward(draft, prompt, 64, NULL);
+    for (int i = 0; i < 8; i++) {
+        int t = spel_argmax(draft->last_logits, c.vocab);
+        spel_forward(draft, &t, 1, NULL);
+    }
+    t0 = spel_now_ms();
+    for (int i = 0; i < gen; i++) {
+        int t = spel_argmax(draft->last_logits, c.vocab);
+        spel_forward(draft, &t, 1, NULL);
+    }
+    dr_ms = spel_now_ms() - t0;
+
+    /* speculative, governor off: raw acceptance */
+    spel_model_reset(target);
+    spel_forward(target, prompt, 64, NULL);
+    spel_model_reset(draft);
+    spel_forward(draft, prompt, 64, NULL);
+    sc.governor = 0;
+    spel_spec_generate(target, draft, 8, out, &sc, &st); /* warm */
+    spel_model_reset(target);
+    spel_forward(target, prompt, 64, NULL);
+    spel_model_reset(draft);
+    spel_forward(draft, prompt, 64, NULL);
+    t0 = spel_now_ms();
+    spel_spec_generate(target, draft, gen, out, &sc, &st);
+    sp_ms = spel_now_ms() - t0;
+
+    /* oracle-style draft: identical weights, float MLP, alpha should be 1.0.
+     * Isolates the runtime/verification cost from draft quality. */
+    spel_model *oracle = spel_model_new(&c, 31337);
+    spel_model_reset(target);
+    spel_forward(target, prompt, 64, NULL);
+    spel_model_reset(oracle);
+    spel_forward(oracle, prompt, 64, NULL);
+    sc.governor = 0;
+    spel_spec_generate(target, oracle, 8, out, &sc, &st_or); /* warm */
+    spel_model_reset(target);
+    spel_forward(target, prompt, 64, NULL);
+    spel_model_reset(oracle);
+    spel_forward(oracle, prompt, 64, NULL);
+    t0 = spel_now_ms();
+    spel_spec_generate(target, oracle, gen, out, &sc, &st_or);
+    double or_ms = spel_now_ms() - t0;
+
+    /* speculative with governor (fallback protects throughput) */
+    sc.governor = 1;
+    sc.alpha_threshold = 0.30;
+    sc.window = 2;
+    spel_model_reset(target);
+    spel_forward(target, prompt, 64, NULL);
+    spel_model_reset(draft);
+    spel_forward(draft, prompt, 64, NULL);
+    spel_spec_generate(target, draft, 8, out, &sc, &st_gov);
+    spel_model_reset(target);
+    spel_forward(target, prompt, 64, NULL);
+    spel_model_reset(draft);
+    spel_forward(draft, prompt, 64, NULL);
+    t0 = spel_now_ms();
+    spel_spec_generate(target, draft, gen, out, &sc, &st_gov);
+    gov_ms = spel_now_ms() - t0;
+
+    double ar_tps = gen / (ar_ms / 1000.0);
+    printf("  AR target    : %7.1f tok/s  (%.2f ms/token)\n", ar_tps, ar_ms / gen);
+    printf("  draft only   : %7.1f tok/s  (%.2f ms/token, cost %.2fx target)\n",
+           gen / (dr_ms / 1000.0), dr_ms / gen, dr_ms / ar_ms);
+    printf("  spec K=4 raw : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
+           gen / (sp_ms / 1000.0), (gen / (sp_ms / 1000.0)) / ar_tps, st.alpha,
+           st.tokens_per_round);
+    printf("  spec oracle  : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
+           gen / (or_ms / 1000.0), (gen / (or_ms / 1000.0)) / ar_tps, st_or.alpha,
+           st_or.tokens_per_round);
+    printf("  spec governed: %7.1f tok/s  (%.2fx AR)  alpha=%.3f  trips=%ld AR-rounds=%ld\n",
+           gen / (gov_ms / 1000.0), (gen / (gov_ms / 1000.0)) / ar_tps, st_gov.alpha,
+           st_gov.governor_trips, st_gov.ar_rounds);
+    printf("  governed rounds=%ld (probe then fallback)\n", st_gov.rounds);
+    printf("  raw rounds=%ld proposed=%ld accepted=%ld\n",
+           st.rounds, st.proposed, st.accepted);
+
+    /* O(1) rollback vs KV memcpy */
+    size_t kvb = spel_kv_bytes(&c);
+    float *a = (float *)malloc(kvb), *bb = (float *)malloc(kvb);
+    memset(a, 1, kvb); memset(bb, 2, kvb);
+    t0 = spel_now_ms();
+    for (int i = 0; i < 200; i++) memcpy(bb, a, kvb);
+    volatile float checksum = 0.0f;
+    for (size_t i = 0; i < kvb / sizeof(float); i += 1024) checksum += bb[i];
+    double copy_us = (spel_now_ms() - t0) * 1000.0 / 200.0;
+    volatile int ptr = 0;
+    t0 = spel_now_ms();
+    for (int i = 0; i < 10000000; i++) ptr = 64 - (i & 3);
+    double reset_ns = (spel_now_ms() - t0) * 1e6 / 10000000.0;
+    printf("  rollback     : pos reset ~%.1f ns, KV copy %.1f us (%.2f MiB), %.0fx\n",
+           reset_ns, copy_us, (double)kvb / 1048576.0,
+           (copy_us * 1000.0) / (reset_ns > 0 ? reset_ns : 1));
+    if (checksum < -1e30f || ptr < -1) printf(" ");
+    printf("  (commit moves a pointer; accepted KV stays in place)\n");
+    free(a); free(bb); free(out);
+    spel_model_free(oracle);
+    spel_model_free(draft);
+    spel_model_free(target);
+}
+
+static void run_bench(void) {
+    printf("== SPEL benchmarks ==\n");
+    bench_ternary();
+    printf("\n");
+    bench_decode();
+}
+
+int main(int argc, char **argv) {
+    const char *cmd = argc > 1 ? argv[1] : "demo";
+    if (!strcmp(cmd, "selftest")) {
+        printf("== SPEL selftest ==\n");
+        test_ternary();
+        test_batch_equiv();
+        test_spec();
+        test_notebank();
+        printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASS", failures);
+        return failures ? 1 : 0;
+    } else if (!strcmp(cmd, "bench")) {
+        run_bench();
+        return 0;
+    } else if (!strcmp(cmd, "demo")) {
+        printf("== SPEL demo: NoteBank + SubTernary on Apple M5 ==\n");
+        test_notebank();
+        printf("\n");
+        spec_result r;
+        run_spec_case(384, 12, 1024, 128, 512, 48, 48, 2026, 0, 0.0, &r);
+        printf("  48-token spec run: %d/%d tokens match AR, alpha=%.3f, %.2f tok/round\n",
+               r.matched, r.n, r.st.alpha, r.st.tokens_per_round);
+        return failures ? 1 : 0;
+    } else {
+        printf("usage: %s [selftest|bench|demo]\n", argv[0]);
+        return 2;
+    }
+}
