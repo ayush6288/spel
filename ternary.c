@@ -11,6 +11,7 @@
  */
 #include "spel.h"
 #include <arm_neon.h>
+#include <sched.h>
 
 int tern_kernel_mode = 0;
 
@@ -204,8 +205,7 @@ const char *tern_kernel_name(void) {
     return "scalar";
 }
 
-void tern_gemv(const tern_mat *m, const float *x, float *y) {
-    int n = m->ncols;
+static float quantize_act(const float *x, int n, int8_t *xq) {
     float xmax = 0.0f;
     for (int i = 0; i < n; i++) {
         float a = fabsf(x[i]);
@@ -213,16 +213,22 @@ void tern_gemv(const tern_mat *m, const float *x, float *y) {
     }
     float xs = xmax / 127.0f;
     if (xs < 1e-12f) xs = 1e-12f;
-    int8_t stackbuf[SPEL_MAX_DFF];
-    int8_t *xq = stackbuf;
-    if (n > SPEL_MAX_DFF) xq = (int8_t *)malloc((size_t)n);
-    if (!xq) return;
     for (int i = 0; i < n; i++) {
         float v = roundf(x[i] / xs);
         if (v > 127.0f) v = 127.0f;
         if (v < -127.0f) v = -127.0f;
         xq[i] = (int8_t)v;
     }
+    return xs;
+}
+
+void tern_gemv(const tern_mat *m, const float *x, float *y) {
+    int n = m->ncols;
+    int8_t stackbuf[SPEL_MAX_DFF];
+    int8_t *xq = stackbuf;
+    if (n > SPEL_MAX_DFF) xq = (int8_t *)malloc((size_t)n);
+    if (!xq) return;
+    float xs = quantize_act(x, n, xq);
     for (int r = 0; r < m->nrows; r++) {
         int32_t acc = tern_dot_i8(m->packed + (size_t)r * m->packed_stride, xq, n);
         y[r] = (float)acc * m->scale[r] * xs;
@@ -292,26 +298,180 @@ static int32_t q8_dot_i8(const int8_t *w, const int8_t *x, int n) {
 
 void q8_gemv(const q8_mat *m, const float *x, float *y) {
     int n = m->ncols;
-    float xmax = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float a = fabsf(x[i]);
-        if (a > xmax) xmax = a;
-    }
-    float xs = xmax / 127.0f;
-    if (xs < 1e-12f) xs = 1e-12f;
     int8_t stackbuf[SPEL_MAX_DFF];
     int8_t *xq = stackbuf;
     if (n > SPEL_MAX_DFF) xq = (int8_t *)malloc((size_t)n);
     if (!xq) return;
-    for (int i = 0; i < n; i++) {
-        float v = roundf(x[i] / xs);
-        if (v > 127.0f) v = 127.0f;
-        if (v < -127.0f) v = -127.0f;
-        xq[i] = (int8_t)v;
-    }
+    float xs = quantize_act(x, n, xq);
     for (int r = 0; r < m->nrows; r++) {
         int32_t acc = q8_dot_i8(m->q + (size_t)r * n, xq, n);
         y[r] = (float)acc * m->scale[r] * xs;
     }
+    if (xq != stackbuf) free(xq);
+}
+
+/* ------------------------------------------------------- draft GEMV pool */
+
+#define SPEL_POOL_SPIN 20000
+
+static void *pool_worker(void *arg) {
+    spel_gemv_pool *p = (spel_gemv_pool *)arg;
+    int seen = 0;
+    for (;;) {
+        int got = 0;
+        for (int i = 0; i < SPEL_POOL_SPIN; i++) {
+            int g = atomic_load_explicit(&p->work_gen, memory_order_acquire);
+            if (g != seen) { seen = g; got = 1; break; }
+            if (atomic_load_explicit(&p->stop_flag, memory_order_acquire))
+                return NULL;
+            if ((i & 63) == 63) sched_yield();
+        }
+        if (!got) {
+            pthread_mutex_lock(&p->mu);
+            while (!p->stop && p->generation == seen)
+                pthread_cond_wait(&p->start_cv, &p->mu);
+            if (p->stop) {
+                pthread_mutex_unlock(&p->mu);
+                break;
+            }
+            seen = p->generation;
+            pthread_mutex_unlock(&p->mu);
+        }
+
+        for (;;) {
+            int r0 = atomic_fetch_add(&p->job.next_row, p->job.block);
+            if (r0 >= p->job.rows) break;
+            int r1 = r0 + p->job.block;
+            if (r1 > p->job.rows) r1 = p->job.rows;
+            if (p->job.kind == 0) {
+                for (int r = r0; r < r1; r++) {
+                    int32_t acc = q8_dot_i8(p->job.w + (size_t)r * p->job.row_stride,
+                                            p->job.xq, p->job.cols);
+                    p->job.y[r] = (float)acc * p->job.scales[r] * p->job.xs;
+                }
+            } else {
+                for (int r = r0; r < r1; r++) {
+                    int32_t acc = tern_dot_i8(p->job.packed + (size_t)r * p->job.row_stride,
+                                              p->job.xq, p->job.cols);
+                    p->job.y[r] = (float)acc * p->job.scales[r] * p->job.xs;
+                }
+            }
+        }
+
+        atomic_fetch_add_explicit(&p->job.done, 1, memory_order_release);
+        pthread_mutex_lock(&p->mu);
+        pthread_cond_broadcast(&p->done_cv);
+        pthread_mutex_unlock(&p->mu);
+    }
+    return NULL;
+}
+
+spel_gemv_pool *spel_pool_create(int nthreads) {
+    if (nthreads <= 1) return NULL;
+    if (nthreads > SPEL_POOL_MAX_THREADS) nthreads = SPEL_POOL_MAX_THREADS;
+    spel_gemv_pool *p = (spel_gemv_pool *)calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    atomic_init(&p->job.next_row, 0);
+    atomic_init(&p->job.done, 0);
+    atomic_init(&p->work_gen, 0);
+    atomic_init(&p->stop_flag, 0);
+    if (pthread_mutex_init(&p->mu, NULL)) { free(p); return NULL; }
+    if (pthread_cond_init(&p->start_cv, NULL)) {
+        pthread_mutex_destroy(&p->mu); free(p); return NULL;
+    }
+    if (pthread_cond_init(&p->done_cv, NULL)) {
+        pthread_cond_destroy(&p->start_cv);
+        pthread_mutex_destroy(&p->mu); free(p); return NULL;
+    }
+    for (int i = 0; i < nthreads; i++) {
+        if (pthread_create(&p->workers[i], NULL, pool_worker, p)) {
+            spel_pool_destroy(p);
+            return NULL;
+        }
+        p->nthreads++;
+    }
+    return p;
+}
+
+void spel_pool_destroy(spel_gemv_pool *p) {
+    if (!p) return;
+    atomic_store_explicit(&p->stop_flag, 1, memory_order_release);
+    pthread_mutex_lock(&p->mu);
+    p->stop = 1;
+    pthread_cond_broadcast(&p->start_cv);
+    pthread_mutex_unlock(&p->mu);
+    for (int i = 0; i < p->nthreads; i++) pthread_join(p->workers[i], NULL);
+    pthread_cond_destroy(&p->done_cv);
+    pthread_cond_destroy(&p->start_cv);
+    pthread_mutex_destroy(&p->mu);
+    free(p);
+}
+
+static void pool_dispatch(spel_gemv_pool *p, int kind,
+                          const int8_t *w, const uint8_t *packed,
+                          const float *scales, const int8_t *xq,
+                          float *y, int rows, int cols, int row_stride,
+                          float xs) {
+    if (!p || p->nthreads <= 1) return;
+    int nt = p->nthreads;
+    int block = (rows + nt * 6 - 1) / (nt * 6);
+    if (block < 1) block = 1;
+    pthread_mutex_lock(&p->mu);
+    p->job.kind = kind;
+    p->job.w = w;
+    p->job.packed = packed;
+    p->job.scales = scales;
+    p->job.xq = xq;
+    p->job.y = y;
+    p->job.rows = rows;
+    p->job.cols = cols;
+    p->job.row_stride = row_stride;
+    p->job.xs = xs;
+    p->job.block = block;
+    atomic_store(&p->job.next_row, 0);
+    atomic_store(&p->job.done, 0);
+    p->generation++;
+    atomic_store_explicit(&p->work_gen, p->generation, memory_order_release);
+    pthread_cond_broadcast(&p->start_cv);
+    pthread_mutex_unlock(&p->mu);
+
+    /* GEMV dispatches are close together; a short acquire spin avoids paying
+     * a condvar wake for every one of the five projections in each layer. */
+    for (int i = 0; i < SPEL_POOL_SPIN; i++) {
+        if (atomic_load_explicit(&p->job.done, memory_order_acquire) >= nt)
+            return;
+        if ((i & 63) == 63) sched_yield();
+    }
+    pthread_mutex_lock(&p->mu);
+    while (atomic_load_explicit(&p->job.done, memory_order_acquire) < nt)
+        pthread_cond_wait(&p->done_cv, &p->mu);
+    pthread_mutex_unlock(&p->mu);
+}
+
+void spel_pool_q8_gemv(spel_gemv_pool *p, const q8_mat *m,
+                       const float *x, float *y) {
+    if (!p || p->nthreads <= 1) { q8_gemv(m, x, y); return; }
+    int n = m->ncols;
+    int8_t stackbuf[SPEL_MAX_DFF];
+    int8_t *xq = stackbuf;
+    if (n > SPEL_MAX_DFF) xq = (int8_t *)malloc((size_t)n);
+    if (!xq) return;
+    float xs = quantize_act(x, n, xq);
+    pool_dispatch(p, 0, m->q, NULL, m->scale, xq, y,
+                  m->nrows, n, n, xs);
+    if (xq != stackbuf) free(xq);
+}
+
+void spel_pool_tern_gemv(spel_gemv_pool *p, const tern_mat *m,
+                         const float *x, float *y) {
+    if (!p || p->nthreads <= 1) { tern_gemv(m, x, y); return; }
+    int n = m->ncols;
+    int8_t stackbuf[SPEL_MAX_DFF];
+    int8_t *xq = stackbuf;
+    if (n > SPEL_MAX_DFF) xq = (int8_t *)malloc((size_t)n);
+    if (!xq) return;
+    float xs = quantize_act(x, n, xq);
+    pool_dispatch(p, 1, NULL, m->packed, m->scale, xq, y,
+                  m->nrows, n, m->packed_stride, xs);
     if (xq != stackbuf) free(xq);
 }

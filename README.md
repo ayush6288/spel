@@ -11,13 +11,12 @@ A self-contained C11 harness for four things on Apple silicon:
 4. **A NoteBank-style writer, compact address bank, state branching and replay
    demo**, wired through to the speculative loop.
 
-> **Status: research harness, not a model release.** The repository now has a
+> **Status: research harness, not a model release.** The repository has a
 > binary checkpoint format, a golden numerical verifier, a cheap-draft oracle,
-> and a self-contained PyTorch training/QAT script. It does **not** ship a
-> trained checkpoint, and no serious full training run has been completed. The
-> committed default is still random initialization, so real acceptance is near
-> the unigram rate. Forced-acceptance rows are systems measurements, not real
-> decoding quality.
+> and a self-contained PyTorch training/QAT script. It does **not** ship the
+> trained checkpoint used for the measurements below; that file is
+> `weights/spel.bin` locally and is gitignored. Forced-acceptance rows are
+> systems measurements, not real decoding quality.
 
 ## Build and run
 
@@ -129,6 +128,47 @@ reported by the same command (`max_abs=0.0188234`, also 16/16 argmax), but only
 the target is part of the pass condition. `make selftest` printed
 `PASS (0 failures)`.
 
+## Phase 2 verification: persistent draft GEMV pool
+
+The draft now owns a persistent pthread pool. `SPEL_DRAFT_THREADS=1..6` selects
+the worker count at draft construction; the default is **1**, which keeps the
+original serial loops unchanged. `spel_model_set_threads()` is used by the
+selftest and benchmark to switch the same loaded draft between 1 and 4 workers.
+Rows are independent dot products, so no numerical reduction crosses threads.
+Each worker handles `BLOCK = ceil(rows/(threads*6))` rows at a time with the
+existing NEON q8/ternary kernels. The serial and pooled paths produce
+bit-identical draft logits.
+
+```sh
+$ make selftest
+...
+[8] draft GEMV pool: threads=1 vs threads=4 bit-exact
+  draft logits: 16 x 128 floats, 0 differ (threads 1 vs 4)
+
+PASS (0 failures)
+
+$ ./spel bench
+```
+
+Three measured runs of `./spel bench` with the downloaded checkpoint produced:
+
+| path | threads | tok/s | c or alpha |
+|---|---:|---:|---|
+| AR target | — | 366.5–371.0 | 2.69–2.73 ms/token |
+| draft 4L only | 1 | 2973.8–2981.9 | c=0.12x target |
+| draft 4L only | 4 | 4394.7–4627.6 | c=0.08x target |
+| spec raw K=16 | 1 | 142.0–144.1 | alpha=0.052 |
+| spec raw K=16 | 4 | 168.7–171.0 | alpha=0.052 |
+| spec governed K=16 | 1 | 341.5–344.0 | alpha=0.094 |
+| spec governed K=16 | 4 | 356.2–361.0 | alpha=0.094 |
+
+The measured draft-only speedup from 1 to 4 workers was **1.47–1.55x**. The
+target verification cost was **v=2.69–2.72x** one AR token in both settings:
+the target path is deliberately unchanged, so the pool changes `c`, not `v`.
+Raw speculative throughput rose from `0.38–0.39x` to `0.46x` AR; governed
+throughput rose from `0.92–0.94x` to `0.97x`. The forced oracle rows remain
+threads=1 system ceilings and are reported separately below.
+
 `bench` and `demo` auto-load weights from `SPEL_WEIGHTS`, or from
 `weights/spel.bin` if that file exists in the current directory:
 
@@ -234,25 +274,24 @@ runtime ceiling of this draft/verifier pair; it is not a decoding benchmark and
 does not claim the draft would accept that many tokens in real generation.
 Forced rows are the median of three runs.
 
-Measured on the same M5 used for the other tables, K=16, mostly loaded smoke
-weights for plumbing validation (random initialization gives the same runtime
-because the shapes are identical):
+Measured on the same M5 used for the other tables, K=16, with the downloaded
+checkpoint. The oracle rows use the threads=1 draft, unchanged from Phase 1:
 
 | path | tok/s | vs AR | real alpha |
 |---|---:|---:|---:|
-| AR target | 373–392 | 1.00x | — |
-| draft 4L only | 2948–2978 | — | — |
-| spec raw K=16 | 84–87 | 0.22–0.23x | 0.005 |
-| spec governed K=16 | 335–361 | 0.89–1.00x | 0.000 |
-| **oracle-4L a=.75** | **1005–1047** | **2.64–2.75x** | forced 0.750 |
-| **oracle-4L a=1.00** | **1266–1309** | **3.31–3.44x** | forced 1.000 |
-| oracle-12L full copy | 298–319 | 0.80–0.90x | 1.000 |
+| AR target | 366.5–371.0 | 1.00x | — |
+| draft 4L only | 2973.8–2981.9 | — | — |
+| spec raw K=16 | 142.0–144.1 | 0.38–0.39x | 0.052 |
+| spec governed K=16 | 341.5–344.0 | 0.92–0.94x | 0.094 |
+| **oracle-4L a=.75** | **1016.6–1019.9** | **2.75–2.78x** | forced 0.750 |
+| **oracle-4L a=1.00** | **1274.5–1290.8** | **3.45–3.52x** | forced 1.000 |
+| oracle-12L full copy | 302.4–311.0 | 0.82–0.84x | 1.000 |
 
 The full-copy oracle is still below AR because it pays nearly one target-sized
 forward per proposal; fast verification alone cannot fix that. The 4-layer
-oracle shows the actual ceiling of the current cheap draft: about **2.7x** at
-75% acceptance and **3.3x** at 100%, with the measured draft cost
-`c ≈ 0.12–0.13x` and verification `v ≈ 2.7x` one AR token.
+oracle shows the actual systems ceiling of the current cheap draft: about
+**2.75x** at 75% acceptance and **3.45x** at 100%, with the measured serial
+draft cost `c ≈ 0.12x` and verification `v ≈ 2.72x` one AR token.
 
 ## Strict mode and fast mode
 
@@ -351,6 +390,9 @@ runs AR. It does not resume mid-call.
 8. **Weights round-trip** — save target+draft as `SPELW001`, load into fresh
    models, compare every target/draft tensor, then run the `SPELV001` verifier.
    `max_abs=0`, 16/16 argmax.
+9. **Draft GEMV pool** — run the same 4-layer draft over the 16 golden tokens
+   with `threads=1` and `threads=4`; all 16 x 128 logits are bit-identical
+   (`0 differ`). This covers q8 `wqkv`/`wo` and ternary `w1`/`w3`/`w2`.
 
 These are same-binary, same-flags guarantees (`-O3 -ffast-math`). Bit-exactness
 across compilers, optimization levels or architectures is not claimed.
@@ -363,12 +405,14 @@ single runs unless marked as medians.
 
 ### Ternary GEMV vs FP32 (4096 x 1536)
 
+Values from the three Phase 2 `./spel bench` runs:
+
 | kernel | GMAC/s | packed GB/s | ms/GEMV |
 |---|---:|---:|---:|
-| neon-dotprod | 17.58–17.78 | 4.4 | 0.35–0.36 |
-| neon-addsub | 10.58–10.75 | 2.6–2.7 | 0.59 |
-| scalar | 2.49–2.52 | 0.6 | 2.50–2.52 |
-| fp32-neon | 5.44–6.67 | 21.8–26.7 | — |
+| neon-dotprod | 17.72–17.78 | 4.4 | 0.35–0.36 |
+| neon-addsub | 10.67–10.68 | 2.7 | 0.59 |
+| scalar | 2.51–2.52 | 0.6 | 2.50 |
+| fp32-neon | 6.20–6.61 | 24.8–26.5 | — |
 
 Packed weights are 1.50 MiB versus 24.00 MiB FP32. The dot-product kernel is
 roughly 3x the FP32 per-MAC rate on this shape.
@@ -380,12 +424,12 @@ in the target batch.
 
 | M | strict v | fast v |
 |---:|---:|---:|
-| 4 | 3.9–4.0 | 1.9–2.0 |
-| 5 | 4.8–5.0 | 2.0–2.1 |
-| 8 | 7.6–7.9 | 2.2–2.3 |
-| 9 | 8.5–8.8 | 2.2–2.3 |
-| 16 | 14.7–15.0 | 2.65–2.70 |
-| 17 | 15.6–15.9 | 2.69–2.77 |
+| 4 | 3.93–3.96 | 1.94–1.97 |
+| 5 | 4.82–4.88 | 1.98–2.02 |
+| 8 | 7.48–7.58 | 2.16–2.19 |
+| 9 | 8.39–8.50 | 2.21–2.26 |
+| 16 | 14.61–14.84 | 2.64–2.69 |
+| 17 | 15.54–15.74 | 2.69–2.74 |
 
 The strict path scales almost linearly with M. Accelerate amortizes the weight
 read and gives roughly a 4–6x reduction at M=17, but it is still **2.7x**, not
@@ -394,26 +438,29 @@ better speculative configuration on this machine.
 
 ### Decode: 64 generated tokens, 4-layer q8/ternary draft
 
-| path | K | tok/s | vs AR | notes |
-|---|---:|---:|---:|---|
-| AR target | — | 360–392 | 1.00x | 2.6–2.8 ms/token |
-| draft 4L only | — | 2948–3014 | — | c = 0.12–0.13x target |
-| spec raw | 8 | 124 | 0.34x | alpha 0.011, 1.08 tok/round |
-| spec governed | 8 | 345–347 | 0.95–0.96x | 1 trip, 63 AR rounds |
-| spec raw | 16 | 84–87 | 0.22–0.23x | alpha 0.005, 1.08 tok/round |
-| spec governed | 16 | 335–361 | 0.89–1.00x | 1 trip, 63 AR rounds |
-| oracle-4L a=.75 | 16 | 1005–1047 | 2.64–2.75x | forced 0.750, 12.8 tok/round |
-| oracle-4L a=1.00 | 16 | 1266–1309 | 3.31–3.44x | forced 1.000, 16.0 tok/round |
-| oracle-12L full copy | 16 | 298–319 | 0.80–0.90x | same weights, alpha 1.000 |
+| path | threads | K | tok/s | vs AR | notes |
+|---|---:|---:|---:|---:|---|
+| AR target | — | — | 366.5–371.0 | 1.00x | 2.69–2.73 ms/token |
+| draft 4L only | 1 | — | 2973.8–2981.9 | — | c = 0.12x target |
+| draft 4L only | 4 | — | 4394.7–4627.6 | — | c = 0.08x target |
+| spec raw | 1 | 16 | 142.0–144.1 | 0.38–0.39x | alpha 0.052, 1.83 tok/round |
+| spec raw | 4 | 16 | 168.7–171.0 | 0.46x | alpha 0.052, 1.83 tok/round |
+| spec governed | 1 | 16 | 341.5–344.0 | 0.92–0.94x | alpha 0.094, 1 trip, 59 AR rounds |
+| spec governed | 4 | 16 | 356.2–361.0 | 0.97x | alpha 0.094, 1 trip, 59 AR rounds |
+| oracle-4L a=.75 | 1 | 16 | 1016.6–1019.9 | 2.75–2.78x | forced 0.750, 12.8 tok/round |
+| oracle-4L a=1.00 | 1 | 16 | 1274.5–1290.8 | 3.45–3.52x | forced 1.000, 16.0 tok/round |
+| oracle-12L full copy | 1 | 16 | 302.4–311.0 | 0.82–0.84x | same weights, alpha 1.000 |
 
-The raw rows are the honest untrained result: the 4-layer draft is almost a
-unigram predictor on a random target, so five of 944 proposals are accepted at
-K=16. The governor converts that into roughly AR throughput by falling back
-after the first failed round. It is a safety mechanism, not a speedup.
+With the downloaded checkpoint, raw K=16 accepts 29 of 560 proposals
+(alpha=0.052) and runs at 0.38–0.39x AR. The governor trips after the first
+round and falls back; it reaches 0.92–0.94x AR, so it is a safety mechanism, not
+a speedup. The forced oracle rows remain benchmark-only system ceilings: the
+draft and target forwards execute, but the accepted prefix is forced to
+`alpha*K`. They are not real decoding quality.
 
-The old 12-layer oracle rows measured 0.82–0.88x AR. It is retained as a
-reference: even at 100% acceptance a target-sized draft is slower than AR
-because it pays roughly one full target forward per proposal.
+The 12-layer full-copy oracle is retained as a reference: even at 100%
+acceptance a target-sized draft is slower than AR because it pays roughly one
+full target forward per proposal.
 
 ### Cost model
 
@@ -425,18 +472,19 @@ pays one `K+1` verification batch:
 speedup(alpha) = (1 + alpha*K) / ((K+1)*c + v_{K+1})
 ```
 
-With measured K=16 values (`c=0.12–0.13`, `v=2.7`):
+With the measured K=16 target values (`v=2.72`) and the Phase 2 draft costs:
 
 ```text
-alpha=.75: (1 + 12.0) / (17*0.125 + 2.7) = 13.0 / 4.825 = 2.69x
-alpha=1.00: (1 + 16.0) / (17*0.125 + 2.7) = 17.0 / 4.825 = 3.52x
+threads=1, c=0.12: alpha=.75 -> 13.0 / (17*0.12 + 2.72) = 2.69x
+threads=1, c=0.12: alpha=1.00 -> 17.0 / (17*0.12 + 2.72) = 3.51x
+threads=4, c=0.08: alpha=.75 -> 13.0 / (17*0.08 + 2.72) = 3.19x
+threads=4, c=0.08: alpha=1.00 -> 17.0 / (17*0.08 + 2.72) = 4.17x
 ```
 
-The measured forced oracle is close (2.64–2.75x and 3.31–3.44x); the small gap
-is draft/verify scheduling and measurement overhead. To reach 2.5x at K=16 the
-draft needs roughly **alpha >= 0.69** with the currently measured `c` and `v`.
-That alpha has **not** been measured on a trained model. It requires the QAT
-distillation run above.
+The measured forced oracle at the serial draft setting is close
+(2.75–2.78x and 3.45–3.52x); the gap is draft/verify scheduling and measurement
+overhead. These projections are formulas, not measured decoding results. Real
+raw/governed throughput is alpha=0.052/0.094 as shown above.
 
 ### Rollback
 
@@ -475,15 +523,16 @@ NoteBank path is still a reference implementation, not a trained memory system.
 
 ## What is still missing
 
-1. **A real trained checkpoint.** `train_colab.py` implements the pipeline, but
-   only short smoke runs have been done locally. The repository intentionally
-   does not commit smoke weights.
-2. **Measured real acceptance.** Random weights accept ~0.5–1.1% of proposals.
-   The 2.7x/3.3x rows are forced-acceptance systems ceilings. A serious Colab
-   run is needed before reporting real speculative throughput.
-3. **Colab validation at full step counts.** The script is self-contained and
-   device-agnostic, but the default 1200+1200-step run has not been executed
-   end-to-end on Colab hardware here.
+1. **A committed trained checkpoint.** The repository does not commit the
+   checkpoint used below. `weights/spel.bin` is local and gitignored; the
+   training run log and exact hyperparameters are not included.
+2. **A real speculative speedup.** On the downloaded checkpoint, measured
+   acceptance is alpha=0.052 raw and 0.094 after the governor; raw reaches
+   0.38–0.46x AR and governed 0.92–0.97x AR. The 2.75–3.52x oracle rows are
+   forced-acceptance system ceilings, not real decoding.
+3. **Scaled verification evidence.** Phase 3 adds the runtime configuration;
+   a scaled trained checkpoint must still be exported and verified before any
+   scaled throughput claim can be made.
 4. **A tokenizer / pretrained model.** This remains an ASCII-token research
    harness, not a llama.cpp/GGUF integration.
 

@@ -331,6 +331,60 @@ static void test_weights_roundtrip(void) {
     spel_model_free(t1); spel_model_free(d1);
 }
 
+static void test_draft_pool(void) {
+    printf("[8] draft GEMV pool: threads=1 vs threads=4 bit-exact\n");
+    spel_cfg c;
+    spel_cfg_init(&c, 384, 12, 6, 1024, 128, 64, 4, 16);
+    spel_model *target = spel_model_new(&c, 24680);
+    int map[4] = {0, 3, 6, 9};
+    spel_model *draft = spel_model_new_draft_subset(target, map, 4);
+    if (!target || !draft) {
+        CHECK(0, "pool test allocation failed");
+        spel_model_free(draft); spel_model_free(target);
+        return;
+    }
+    int n = SPEL_GOLDEN_LEN;
+    float *serial = (float *)malloc((size_t)n * c.vocab * sizeof(float));
+    float *pooled = (float *)malloc((size_t)n * c.vocab * sizeof(float));
+    if (!serial || !pooled) {
+        CHECK(0, "pool test logits allocation failed");
+        free(serial); free(pooled);
+        spel_model_free(draft); spel_model_free(target);
+        return;
+    }
+
+    CHECK(spel_model_threads(draft) >= 1, "draft thread count invalid");
+    CHECK(spel_model_set_threads(draft, 1) == 0, "set threads=1 failed");
+    CHECK(spel_model_threads(draft) == 1, "draft did not switch to serial");
+    spel_model_reset(draft);
+    for (int i = 0; i < n; i++) {
+        int tok = (i * 29 + 7) % c.vocab;
+        spel_forward(draft, &tok, 1, NULL);
+        memcpy(serial + (size_t)i * c.vocab, draft->last_logits,
+               (size_t)c.vocab * sizeof(float));
+    }
+
+    CHECK(spel_model_set_threads(draft, 4) == 0, "set threads=4 failed");
+    CHECK(spel_model_threads(draft) == 4, "draft thread count not 4");
+    spel_model_reset(draft);
+    for (int i = 0; i < n; i++) {
+        int tok = (i * 29 + 7) % c.vocab;
+        spel_forward(draft, &tok, 1, NULL);
+        memcpy(pooled + (size_t)i * c.vocab, draft->last_logits,
+               (size_t)c.vocab * sizeof(float));
+    }
+
+    int diff = 0;
+    for (int i = 0; i < n * c.vocab; i++)
+        if (memcmp(&serial[i], &pooled[i], sizeof(float))) diff++;
+    printf("  draft logits: %d x %d floats, %d differ (threads 1 vs 4)\n",
+           n, c.vocab, diff);
+    CHECK(diff == 0, "pooled draft logits differ from serial");
+
+    free(serial); free(pooled);
+    spel_model_free(draft); spel_model_free(target);
+}
+
 static void test_fast_mode(void) {
     printf("[5] Accelerate fast path: token equivalence (not bitwise)\n");
     spel_cfg c;
@@ -747,7 +801,8 @@ static void bench_decode(void) {
     const int gen = 64, warm_n = 8;
     int warm[8];
     int *out = (int *)malloc((size_t)gen * sizeof(int));
-    double ar_ms, dr_ms, sp_ms, gov_ms;
+    double ar_ms, dr_ms[2], sp_ms[2], gov_ms[2];
+    const int thread_counts[2] = {1, 4};
 
     prepare_pair(target, draft, prompt, 64, warm_n, warm);
     spel_ckpt *cp_t = spel_ckpt_new(target);
@@ -761,18 +816,8 @@ static void bench_decode(void) {
     }
     ar_ms = spel_now_ms() - t0;
 
-    /* draft-only (same prefix, then its own greedy stream) */
-    spel_model_reset(draft);
-    prefill_chunks(draft, prompt, 64);
-    for (int i = 0; i < warm_n; i++) spel_forward(draft, &warm[i], 1, NULL);
-    t0 = spel_now_ms();
-    for (int i = 0; i < gen; i++) {
-        int t = spel_argmax(draft->last_logits, c.vocab);
-        spel_forward(draft, &t, 1, NULL);
-    }
-    dr_ms = spel_now_ms() - t0;
-
-    /* Fast verification cost for the K+1 batch. */
+    /* Fast verification cost for the K+1 batch. The target path is unchanged
+     * by the draft pool, so this v applies to both thread settings. */
     spel_ckpt_load(target, cp_t);
     int vtoks[17] = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2};
     spel_use_accelerate = 1;
@@ -786,31 +831,59 @@ static void bench_decode(void) {
     }
     double v_ms = (spel_now_ms() - t0) / viters;
 
-    /* Raw speculative decode, governor off, fast verification. */
-    spel_ckpt_load(target, cp_t);
-    spel_ckpt_load(draft, cp_d);
+    spel_spec_stats st[2], st_gov[2], st_or;
     spel_spec_cfg sc; spel_spec_cfg_default(&sc, K);
-    sc.governor = 0;
-    spel_spec_stats st, st_gov, st_or;
-    spel_spec_generate(target, draft, warm_n, out, &sc, &st); /* warm caches */
-    spel_ckpt_load(target, cp_t);
-    spel_ckpt_load(draft, cp_d);
-    t0 = spel_now_ms();
-    spel_spec_generate(target, draft, gen, out, &sc, &st);
-    sp_ms = spel_now_ms() - t0;
+    for (int ti = 0; ti < 2; ti++) {
+        int nt = thread_counts[ti];
+        if (spel_model_set_threads(draft, nt)) {
+            printf("  draft threads=%d unavailable\n", nt);
+            continue;
+        }
 
-    /* Governed speculative decode. */
-    sc.governor = 1;
-    sc.alpha_threshold = 0.30;
-    sc.window = 2;
-    spel_ckpt_load(target, cp_t);
-    spel_ckpt_load(draft, cp_d);
-    spel_spec_generate(target, draft, warm_n, out, &sc, &st_gov); /* warm */
-    spel_ckpt_load(target, cp_t);
-    spel_ckpt_load(draft, cp_d);
-    t0 = spel_now_ms();
-    spel_spec_generate(target, draft, gen, out, &sc, &st_gov);
-    gov_ms = spel_now_ms() - t0;
+        /* draft-only (same prefix, then its own greedy stream) */
+        spel_model_reset(draft);
+        prefill_chunks(draft, prompt, 64);
+        for (int i = 0; i < warm_n; i++) spel_forward(draft, &warm[i], 1, NULL);
+        t0 = spel_now_ms();
+        for (int i = 0; i < gen; i++) {
+            int t = spel_argmax(draft->last_logits, c.vocab);
+            spel_forward(draft, &t, 1, NULL);
+        }
+        dr_ms[ti] = spel_now_ms() - t0;
+
+        /* Raw speculative decode, governor off, fast verification. */
+        spel_ckpt_load(target, cp_t);
+        spel_ckpt_load(draft, cp_d);
+        sc.governor = 0;
+        spel_spec_generate(target, draft, warm_n, out, &sc, &st[ti]); /* warm */
+        spel_ckpt_load(target, cp_t);
+        spel_ckpt_load(draft, cp_d);
+        t0 = spel_now_ms();
+        spel_spec_generate(target, draft, gen, out, &sc, &st[ti]);
+        sp_ms[ti] = spel_now_ms() - t0;
+
+        /* Governed speculative decode. */
+        sc.governor = 1;
+        sc.alpha_threshold = 0.30;
+        sc.window = 2;
+        spel_ckpt_load(target, cp_t);
+        spel_ckpt_load(draft, cp_d);
+        spel_spec_generate(target, draft, warm_n, out, &sc, &st_gov[ti]); /* warm */
+        spel_ckpt_load(target, cp_t);
+        spel_ckpt_load(draft, cp_d);
+        t0 = spel_now_ms();
+        spel_spec_generate(target, draft, gen, out, &sc, &st_gov[ti]);
+        gov_ms[ti] = spel_now_ms() - t0;
+    }
+
+    /* The forced oracle remains a threads=1 draft measurement, unchanged from
+     * before Phase 2, so its systems-ceiling rows stay comparable. */
+    if (spel_model_set_threads(draft, 1)) {
+        printf("  failed to restore draft threads=1\n");
+        spel_model_free(draft); spel_model_free(target);
+        spel_ckpt_free(cp_t); spel_ckpt_free(cp_d); free(out);
+        return;
+    }
 
     /* Benchmark-only forced-acceptance oracle. This is the same 4-layer
      * q8/ternary draft as the raw/governed rows and the same M=17 Accelerate
@@ -842,19 +915,33 @@ static void bench_decode(void) {
     sc.force_alpha = -1.0;
 
     double ar_tps = gen / (ar_ms / 1000.0);
-    double c_draft = dr_ms / ar_ms;
     double v = v_ms / (ar_ms / gen);
     printf("  AR target    : %7.1f tok/s  (%.2f ms/token)\n", ar_tps, ar_ms / gen);
-    printf("  draft 4L only: %7.1f tok/s  (%.2f ms/token, c=%.2fx target)\n",
-           gen / (dr_ms / 1000.0), dr_ms / gen, c_draft);
-    printf("  verify K+1=%d : %6.2f ms  v=%.2fx AR token  (fast mode)\n",
+    for (int ti = 0; ti < 2; ti++) {
+        double c_draft = dr_ms[ti] / ar_ms;
+        printf("  draft 4L t=%d : %7.1f tok/s  (%.2f ms/token, c=%.2fx target)\n",
+               thread_counts[ti], gen / (dr_ms[ti] / 1000.0),
+               dr_ms[ti] / gen, c_draft);
+    }
+    printf("  verify K+1=%d : %6.2f ms  v=%.2fx AR token  (fast mode, target path)\n",
            K + 1, v_ms, v);
-    printf("  spec K=%d raw : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
-           K, gen / (sp_ms / 1000.0), (gen / (sp_ms / 1000.0)) / ar_tps,
-           st.alpha, st.tokens_per_round);
-    printf("  spec K=%d gov : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  trips=%ld AR-rounds=%ld\n",
-           K, gen / (gov_ms / 1000.0), (gen / (gov_ms / 1000.0)) / ar_tps,
-           st_gov.alpha, st_gov.governor_trips, st_gov.ar_rounds);
+    for (int ti = 0; ti < 2; ti++) {
+        double c_draft = dr_ms[ti] / ar_ms;
+        printf("  spec K=%d raw t=%d: %7.1f tok/s  (%.2fx AR)  "
+               "alpha=%.3f  c=%.2f  v=%.2f  (%.2f tok/round)\n",
+               K, thread_counts[ti], gen / (sp_ms[ti] / 1000.0),
+               (gen / (sp_ms[ti] / 1000.0)) / ar_tps,
+               st[ti].alpha, c_draft, v, st[ti].tokens_per_round);
+    }
+    for (int ti = 0; ti < 2; ti++) {
+        double c_draft = dr_ms[ti] / ar_ms;
+        printf("  spec K=%d gov t=%d: %7.1f tok/s  (%.2fx AR)  "
+               "alpha=%.3f  c=%.2f  v=%.2f  trips=%ld AR-rounds=%ld\n",
+               K, thread_counts[ti], gen / (gov_ms[ti] / 1000.0),
+               (gen / (gov_ms[ti] / 1000.0)) / ar_tps,
+               st_gov[ti].alpha, c_draft, v,
+               st_gov[ti].governor_trips, st_gov[ti].ar_rounds);
+    }
     printf("  spec oracle-4L (alpha=0.75): %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
            gen / (forced_ms[0] / 1000.0),
            (gen / (forced_ms[0] / 1000.0)) / ar_tps,
@@ -864,12 +951,17 @@ static void bench_decode(void) {
            (gen / (forced_ms[1] / 1000.0)) / ar_tps,
            forced_st[1].alpha, forced_st[1].tokens_per_round);
 
-    double proj75 = (1.0 + 0.75 * K) / ((K + 1) * c_draft + v);
-    double proj100 = (1.0 + 1.00 * K) / ((K + 1) * c_draft + v);
-    printf("  projected    : a=.75 %.2fx  a=1.00 %.2fx  "
-           "(K=%d, c=%.2f, v=%.2f)\n", proj75, proj100, K, c_draft, v);
-    printf("  raw rounds=%ld proposed=%ld accepted=%ld\n",
-           st.rounds, st.proposed, st.accepted);
+    for (int ti = 0; ti < 2; ti++) {
+        double c_draft = dr_ms[ti] / ar_ms;
+        double proj75 = (1.0 + 0.75 * K) / ((K + 1) * c_draft + v);
+        double proj100 = (1.0 + 1.00 * K) / ((K + 1) * c_draft + v);
+        printf("  projected t=%d: a=.75 %.2fx  a=1.00 %.2fx  "
+               "(K=%d, c=%.2f, v=%.2f)\n",
+               thread_counts[ti], proj75, proj100, K, c_draft, v);
+    }
+    for (int ti = 0; ti < 2; ti++)
+        printf("  raw t=%d rounds=%ld proposed=%ld accepted=%ld\n",
+               thread_counts[ti], st[ti].rounds, st[ti].proposed, st[ti].accepted);
 
     /* Reference: full 12-layer FP32 copy of the target as draft. This is not
      * the cheap-draft system ceiling; it shows why a target-sized draft cannot
@@ -953,6 +1045,7 @@ int main(int argc, char **argv) {
         test_fast_mode();
         test_forced_acceptance();
         test_weights_roundtrip();
+        test_draft_pool();
         printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASS", failures);
         return failures ? 1 : 0;
     } else if (!strcmp(cmd, "bench")) {

@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #define SPEL_MAX_LAYERS   16
 #define SPEL_MAX_HEADS    16
@@ -87,6 +89,45 @@ void q8_mat_free(q8_mat *m);
 void q8_quantize_mat(q8_mat *m, const float *w);
 void q8_gemv(const q8_mat *m, const float *x, float *y);
 
+/* ------------------------------------------------------- draft GEMV pool */
+/* Persistent row-parallel workers for the cheap draft's q8/ternary GEMVs.
+ * Row ranges are independent, so the result is bit-identical to the serial
+ * loops regardless of thread count. The pool is created once per draft model
+ * (SPEL_DRAFT_THREADS=1..6, default 1) and reused. */
+
+#define SPEL_POOL_MAX_THREADS 6
+
+typedef struct {
+    const int8_t  *w;       /* q8 rows (kind 0) */
+    const uint8_t *packed;  /* ternary rows (kind 1) */
+    const float   *scales;
+    const int8_t  *xq;
+    float         *y;
+    int rows, cols, row_stride;
+    float xs;
+    int block, kind;        /* kind: 0 = q8, 1 = ternary */
+    atomic_int next_row;
+    atomic_int done;
+} spel_gemv_job;
+
+typedef struct spel_gemv_pool {
+    int nthreads;
+    pthread_t workers[SPEL_POOL_MAX_THREADS];
+    pthread_mutex_t mu;
+    pthread_cond_t start_cv, done_cv;
+    int generation, stop;
+    atomic_int work_gen;
+    atomic_int stop_flag;
+    spel_gemv_job job;
+} spel_gemv_pool;
+
+spel_gemv_pool *spel_pool_create(int nthreads); /* NULL for nthreads <= 1 */
+void spel_pool_destroy(spel_gemv_pool *p);
+void spel_pool_q8_gemv(spel_gemv_pool *p, const q8_mat *m,
+                       const float *x, float *y);
+void spel_pool_tern_gemv(spel_gemv_pool *p, const tern_mat *m,
+                         const float *x, float *y);
+
 /* --------------------------------------------------------------- model */
 
 typedef struct {
@@ -132,6 +173,8 @@ typedef struct spel_model {
     float *last_logits;             /* [vocab] */
     int pos;                        /* number of tokens processed */
     int is_ternary;
+    int draft_threads;              /* 1 = serial; 2..6 = pooled draft GEMVs */
+    spel_gemv_pool *pool;           /* owned by this model */
 
     /* optional activation capture for NoteBank (linear layers only) */
     float *cap_q, *cap_k;
@@ -152,6 +195,10 @@ void        spel_model_free(spel_model *m);
 void        spel_model_reset(spel_model *m);
 /* Non-owning link used by spel_save_weights(m, path). */
 void        spel_model_attach_draft(spel_model *target, spel_model *draft);
+/* Reconfigure the draft's persistent GEMV pool. nthreads=1 disables it and
+ * uses the existing serial loops unchanged. */
+int         spel_model_set_threads(spel_model *m, int nthreads);
+int         spel_model_threads(const spel_model *m);
 
 /* ------------------------------------------------ binary weights SPELW001 */
 /* Header: 8-byte magic "SPELW001", u32 version=1, d_model, n_layers, n_heads,

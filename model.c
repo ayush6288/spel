@@ -257,6 +257,14 @@ static size_t layer_tensor_count(const spel_cfg *c, int is_linear) {
     return n;
 }
 
+static int draft_threads_from_env(void) {
+    const char *s = getenv("SPEL_DRAFT_THREADS");
+    if (!s || !s[0]) return 1;
+    int n = atoi(s);
+    if (n < 1 || n > SPEL_POOL_MAX_THREADS) return 1;
+    return n;
+}
+
 spel_model *spel_model_new_draft_subset(const spel_model *t,
                                         const int *layer_map, int n_layers) {
     if (!t || !layer_map || n_layers <= 0 ||
@@ -335,6 +343,12 @@ spel_model *spel_model_new_draft_subset(const spel_model *t,
     }
     alloc_runtime(m);
     if (!m->buf || !m->last_logits) { spel_model_free(m); return NULL; }
+    int nt = draft_threads_from_env();
+    if (nt > 1) {
+        m->pool = spel_pool_create(nt);
+        if (!m->pool) { spel_model_free(m); return NULL; }
+    }
+    m->draft_threads = nt;
     m->pos = 0;
     return m;
 }
@@ -345,8 +359,26 @@ spel_model *spel_model_new_draft(const spel_model *t) {
     return spel_model_new_draft_subset(t, map, t->cfg.n_layers);
 }
 
+int spel_model_set_threads(spel_model *m, int nthreads) {
+    if (!m || !m->is_ternary ||
+        nthreads < 1 || nthreads > SPEL_POOL_MAX_THREADS) return -1;
+    if (nthreads == m->draft_threads) return 0;
+    spel_gemv_pool *p = nthreads > 1 ? spel_pool_create(nthreads) : NULL;
+    if (nthreads > 1 && !p) return -1;
+    spel_pool_destroy(m->pool);
+    m->pool = p;
+    m->draft_threads = nthreads;
+    return 0;
+}
+
+int spel_model_threads(const spel_model *m) {
+    return m ? m->draft_threads : 0;
+}
+
 void spel_model_free(spel_model *m) {
     if (!m) return;
+    spel_pool_destroy(m->pool);
+    m->pool = NULL;
     for (int l = 0; l < m->cfg.n_layers; l++) {
         free(m->kv_k[l]); free(m->kv_v[l]);
         free(m->S[l]); free(m->xh[l]);
@@ -465,11 +497,24 @@ static void attention_rows(spel_model *m, int l, float *qkv, int M,
 
 /* ----------------------------------------------------- recurrent layer */
 
+static void draft_q8_gemv(spel_model *m, const q8_mat *mat,
+                          const float *x, float *y) {
+    if (m->pool) spel_pool_q8_gemv(m->pool, mat, x, y);
+    else q8_gemv(mat, x, y);
+}
+
+static void draft_tern_gemv(spel_model *m, const tern_mat *mat,
+                            const float *x, float *y) {
+    if (m->pool) spel_pool_tern_gemv(m->pool, mat, x, y);
+    else tern_gemv(mat, x, y);
+}
+
 static void proj_qkv(spel_model *m, spel_layer *L, const float *x, float *y,
                      int M, int d) {
     if (m->is_ternary && L->q_wqkv.q) {
         for (int r = 0; r < M; r++)
-            q8_gemv(&L->q_wqkv, x + (size_t)r * d, y + (size_t)r * 3 * d);
+            draft_q8_gemv(m, &L->q_wqkv, x + (size_t)r * d,
+                          y + (size_t)r * 3 * d);
     } else {
         matmul_rows(y, x, L->wqkv, M, 3 * d, d);
     }
@@ -479,7 +524,8 @@ static void proj_wo(spel_model *m, spel_layer *L, const float *x, float *y,
                     int M, int d) {
     if (m->is_ternary && L->q_wo.q) {
         for (int r = 0; r < M; r++)
-            q8_gemv(&L->q_wo, x + (size_t)r * d, y + (size_t)r * d);
+            draft_q8_gemv(m, &L->q_wo, x + (size_t)r * d,
+                          y + (size_t)r * d);
     } else {
         matmul_rows(y, x, L->wo, M, d, d);
     }
@@ -582,13 +628,15 @@ static void mlp_rows(spel_model *m, int l, const float *xn, int M,
         matmul_rows(out, hh, L->w2, M, c->d_model, c->d_ff);
     } else {
         for (int r = 0; r < M; r++) {
-            tern_gemv(&L->t1, xn + (size_t)r * c->d_model, h1 + (size_t)r * c->d_ff);
-            tern_gemv(&L->t3, xn + (size_t)r * c->d_model, h3 + (size_t)r * c->d_ff);
+            draft_tern_gemv(m, &L->t1, xn + (size_t)r * c->d_model,
+                            h1 + (size_t)r * c->d_ff);
+            draft_tern_gemv(m, &L->t3, xn + (size_t)r * c->d_model,
+                            h3 + (size_t)r * c->d_ff);
             float *a = h1 + (size_t)r * c->d_ff;
             float *b = h3 + (size_t)r * c->d_ff;
             float *y = hh + (size_t)r * c->d_ff;
             for (int i = 0; i < c->d_ff; i++) y[i] = silu(a[i]) * b[i];
-            tern_gemv(&L->t2, y, out + (size_t)r * c->d_model);
+            draft_tern_gemv(m, &L->t2, y, out + (size_t)r * c->d_model);
         }
     }
 }
