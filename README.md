@@ -112,6 +112,23 @@ condition because the draft is quantized after loading. A C save/load round-trip
 is also exercised by `make selftest` and currently reports `max_abs=0` for both
 models.
 
+## Phase 1 verification
+
+The downloaded Colab checkpoint was checked without changing any math:
+
+```sh
+$ make selftest && make bench
+$ ./spel verify-weights weights/spel.bin
+  target: max_abs=7.39098e-06  argmax=16/16
+  draft : max_abs=0.0188234  argmax=16/16
+```
+
+The target passed the verifier at **16/16 argmax** with
+**target `max_abs=7.39098e-06`**, below the required `1e-3`. The draft is
+reported by the same command (`max_abs=0.0188234`, also 16/16 argmax), but only
+the target is part of the pass condition. `make selftest` printed
+`PASS (0 failures)`.
+
 `bench` and `demo` auto-load weights from `SPEL_WEIGHTS`, or from
 `weights/spel.bin` if that file exists in the current directory:
 
