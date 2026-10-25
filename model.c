@@ -47,6 +47,9 @@ double spel_now_ms(void) {
 
 int spel_cfg_init(spel_cfg *c, int d, int layers, int heads, int dff,
                   int vocab, int max_seq, int attn_period, int K) {
+    if (!c || d <= 0 || layers < 1 || layers > SPEL_MAX_LAYERS ||
+        heads < 1 || heads > SPEL_MAX_HEADS || attn_period < 2)
+        return -1;
     memset(c, 0, sizeof(*c));
     c->d_model = d;
     c->n_layers = layers;
@@ -58,6 +61,10 @@ int spel_cfg_init(spel_cfg *c, int d, int layers, int heads, int dff,
     c->attn_period = attn_period;
     c->conv_k = 3;
     c->spec_k = K;
+    c->draft_map[0] = 0;
+    c->draft_map[1] = 3;
+    c->draft_map[2] = 6;
+    c->draft_map[3] = 9;
     c->n_linear = c->n_attn = 0;
     for (int i = 0; i < layers; i++) {
         int is_attn = ((i + 1) % attn_period == 0);
@@ -70,10 +77,13 @@ int spel_cfg_init(spel_cfg *c, int d, int layers, int heads, int dff,
 }
 
 int spel_cfg_validate(const spel_cfg *c) {
+    if (!c->n_heads || c->n_heads < 0 || c->n_heads > SPEL_MAX_HEADS) return -1;
     if (c->d_model <= 0 || c->d_model > SPEL_MAX_D) return -1;
     if (c->d_model % c->n_heads) return -1;
-    if (c->n_heads > SPEL_MAX_HEADS || c->n_layers > SPEL_MAX_LAYERS) return -1;
-    if (c->d_ff > SPEL_MAX_DFF || c->vocab > SPEL_MAX_VOCAB) return -1;
+    if (c->head_dim != c->d_model / c->n_heads) return -1;
+    if (c->n_layers < 1 || c->n_layers > SPEL_MAX_LAYERS) return -1;
+    if (c->d_ff <= 0 || c->d_ff > SPEL_MAX_DFF) return -1;
+    if (c->vocab <= 0 || c->vocab > SPEL_MAX_VOCAB) return -1;
     if (c->max_seq > SPEL_MAX_SEQ || c->max_seq < 8) return -1;
     if (c->spec_k < 1 || c->spec_k > SPEL_MAX_BATCH) return -1;
     if (c->attn_period < 2) return -1;
@@ -1032,7 +1042,8 @@ int spel_save_weights(const spel_model *m, const char *path) {
      * copied from the target and quantized on load. Callers that have a
      * distilled draft should attach it or use spel_save_weights_pair. */
     if (m->cfg.n_layers >= 10) {
-        int map[4] = {0, 3, 6, 9};
+        int map[4];
+        for (int i = 0; i < 4; i++) map[i] = m->cfg.draft_map[i];
         spel_model *tmp = spel_model_new_draft_subset(m, map, 4);
         if (!tmp) return -1;
         int r = spel_save_weights_pair(m, tmp, path);
@@ -1132,6 +1143,16 @@ int spel_load_weights(spel_model *m, const char *path) {
     return spel_load_weights_pair(m, m->draft, path);
 }
 
+static double verify_tolerance(void) {
+    const char *s = getenv("SPEL_VERIFY_TOL");
+    if (s && s[0]) {
+        char *end = NULL;
+        double v = strtod(s, &end);
+        if (end != s && *end == '\0' && v > 0.0 && isfinite(v)) return v;
+    }
+    return 1e-3;
+}
+
 int spel_verify_weights(spel_model *target, spel_model *draft, const char *path) {
     if (!target || !draft) return -1;
     if (spel_load_weights_pair(target, draft, path)) {
@@ -1172,10 +1193,12 @@ int spel_verify_weights(spel_model *target, spel_model *draft, const char *path)
         if (spel_argmax(at, V) == spel_argmax(et, V)) targ++;
         if (spel_argmax(ad, V) == spel_argmax(ed, V)) darg++;
     }
+    double tol = verify_tolerance();
+    printf("  tolerance: %.6g\n", tol);
     printf("  target: max_abs=%.6g  argmax=%d/%d\n", tmax, targ, n);
     printf("  draft : max_abs=%.6g  argmax=%d/%d\n", dmax, darg, n);
     free(tl); free(dl);
-    return (targ == n && tmax < 1e-3) ? 0 : 1;
+    return (targ == n && tmax < tol) ? 0 : 1;
 }
 
 

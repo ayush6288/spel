@@ -22,8 +22,8 @@
 
 #define SPEL_MAX_LAYERS   16
 #define SPEL_MAX_HEADS    16
-#define SPEL_MAX_D        512
-#define SPEL_MAX_DFF      1536
+#define SPEL_MAX_D        1024
+#define SPEL_MAX_DFF      4096
 #define SPEL_MAX_SEQ      4096
 #define SPEL_MAX_VOCAB    1024
 #define SPEL_MAX_BATCH    16
@@ -38,6 +38,7 @@ typedef struct {
     int attn_period;                 /* every attn_period-th layer is attention */
     int conv_k;                      /* short conv taps in recurrent layers */
     int spec_k;                      /* speculative depth K */
+    int draft_map[4];                /* default distilled-draft source layers */
     int n_linear, n_attn, n_channels;/* n_channels = n_linear * n_heads */
     int is_linear[SPEL_MAX_LAYERS];
     int lin_index[SPEL_MAX_LAYERS];  /* -1 for attention layers */

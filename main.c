@@ -2,6 +2,9 @@
 #include "spel.h"
 #include <arm_neon.h>
 #include <time.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/stat.h>
 
 static int failures = 0;
 #define CHECK(cond, ...) do { \
@@ -27,6 +30,171 @@ static const char *weights_path(void) {
     if (p && p[0]) return p;
     if (file_exists("weights/spel.bin")) return "weights/spel.bin";
     return NULL;
+}
+
+/* Runtime dimension config. Defaults are exactly the historical 384/12/1024
+ * model. Environment variables and --config key=value,... override them; the
+ * C build remains default-identical when none are set. */
+typedef struct {
+    int d_model, n_layers, n_heads, head_dim, d_ff, vocab;
+    int max_seq, attn_period, spec_k;
+    int draft_map[4];
+} cfg_fields;
+
+static void cfg_fields_default(cfg_fields *f) {
+    f->d_model = 384;
+    f->n_layers = 12;
+    f->n_heads = 6;
+    f->head_dim = 0;
+    f->d_ff = 1024;
+    f->vocab = 128;
+    f->max_seq = 512;
+    f->attn_period = 4;
+    f->spec_k = 16;
+    int map[4] = {0, 3, 6, 9};
+    memcpy(f->draft_map, map, sizeof(map));
+}
+
+static int parse_int_str(const char *s, int *out) {
+    if (!s || !s[0]) return -1;
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || end == s || *end || v < INT_MIN || v > INT_MAX) return -1;
+    *out = (int)v;
+    return 0;
+}
+
+static int parse_int_list(const char *s, int *out, int n) {
+    char buf[256];
+    if (!s || strlen(s) >= sizeof(buf)) return -1;
+    memcpy(buf, s, strlen(s) + 1);
+    int count = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ":+, ", &save); tok;
+         tok = strtok_r(NULL, ":+, ", &save)) {
+        if (count >= n || parse_int_str(tok, &out[count])) return -1;
+        count++;
+    }
+    return count == n ? 0 : -1;
+}
+
+static int env_int(const char *name, int *out) {
+    const char *s = getenv(name);
+    if (!s || !s[0]) return 0;
+    return parse_int_str(s, out) ? -1 : 1;
+}
+
+static int apply_kv(cfg_fields *f, char *kv) {
+    char *eq = strchr(kv, '=');
+    if (!eq) return -1;
+    *eq = '\0';
+    const char *key = kv, *val = eq + 1;
+    int *field = NULL;
+    if (!strcmp(key, "d_model")) field = &f->d_model;
+    else if (!strcmp(key, "n_layers")) field = &f->n_layers;
+    else if (!strcmp(key, "n_heads")) field = &f->n_heads;
+    else if (!strcmp(key, "head_dim")) field = &f->head_dim;
+    else if (!strcmp(key, "d_ff")) field = &f->d_ff;
+    else if (!strcmp(key, "vocab")) field = &f->vocab;
+    else if (!strcmp(key, "max_seq")) field = &f->max_seq;
+    else if (!strcmp(key, "attn_period")) field = &f->attn_period;
+    else if (!strcmp(key, "spec_k")) field = &f->spec_k;
+    else if (!strcmp(key, "draft_map")) return parse_int_list(val, f->draft_map, 4);
+    else return -1;
+    return parse_int_str(val, field);
+}
+
+static int apply_config_string(cfg_fields *f, const char *s) {
+    char buf[512];
+    if (!s || strlen(s) >= sizeof(buf)) return -1;
+    memcpy(buf, s, strlen(s) + 1);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        if (apply_kv(f, tok)) return -1;
+    }
+    return 0;
+}
+
+static int apply_env_config(cfg_fields *f) {
+    const char *all = getenv("SPEL_CONFIG");
+    if (all && all[0] && apply_config_string(f, all)) return -1;
+    if (env_int("SPEL_D_MODEL", &f->d_model) < 0) return -1;
+    if (env_int("SPEL_N_LAYERS", &f->n_layers) < 0) return -1;
+    if (env_int("SPEL_N_HEADS", &f->n_heads) < 0) return -1;
+    if (env_int("SPEL_HEAD_DIM", &f->head_dim) < 0) return -1;
+    if (env_int("SPEL_D_FF", &f->d_ff) < 0) return -1;
+    if (env_int("SPEL_VOCAB", &f->vocab) < 0) return -1;
+    if (env_int("SPEL_MAX_SEQ", &f->max_seq) < 0) return -1;
+    if (env_int("SPEL_ATTN_PERIOD", &f->attn_period) < 0) return -1;
+    if (env_int("SPEL_SPEC_K", &f->spec_k) < 0) return -1;
+    const char *dm = getenv("SPEL_DRAFT_MAP");
+    if (dm && dm[0] && parse_int_list(dm, f->draft_map, 4)) return -1;
+    return 0;
+}
+
+static int build_run_cfg(int argc, char **argv, int first, spel_cfg *out) {
+    cfg_fields f;
+    cfg_fields_default(&f);
+    if (apply_env_config(&f)) {
+        printf("invalid configuration in environment\n");
+        return -1;
+    }
+    for (int i = first; i < argc; i++) {
+        if (!strcmp(argv[i], "--config")) {
+            if (++i >= argc || apply_config_string(&f, argv[i])) {
+                printf("invalid --config string\n");
+                return -1;
+            }
+        } else {
+            printf("unknown option: %s\n", argv[i]);
+            return -1;
+        }
+    }
+    if (f.head_dim && (f.n_heads <= 0 || f.head_dim != f.d_model / f.n_heads)) {
+        printf("invalid config: head_dim must equal d_model / n_heads\n");
+        return -1;
+    }
+    if (spel_cfg_init(out, f.d_model, f.n_layers, f.n_heads, f.d_ff,
+                     f.vocab, f.max_seq, f.attn_period, f.spec_k)) {
+        printf("invalid config: dimensions exceed C limits or are inconsistent\n");
+        return -1;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (f.draft_map[i] < 0 || f.draft_map[i] >= out->n_layers) {
+            printf("invalid config: draft_map[%d]=%d outside 0..%d\n",
+                   i, f.draft_map[i], out->n_layers - 1);
+            return -1;
+        }
+        out->draft_map[i] = f.draft_map[i];
+    }
+    return 0;
+}
+
+static void print_cfg(const spel_cfg *c) {
+    printf("  config: d_model=%d n_layers=%d n_heads=%d head_dim=%d d_ff=%d "
+           "vocab=%d max_seq=%d attn_period=%d spec_k=%d "
+           "draft_map=[%d,%d,%d,%d]\n",
+           c->d_model, c->n_layers, c->n_heads, c->head_dim, c->d_ff,
+           c->vocab, c->max_seq, c->attn_period, c->spec_k,
+           c->draft_map[0], c->draft_map[1], c->draft_map[2], c->draft_map[3]);
+}
+
+static void print_weight_info(const char *path, const spel_model *target,
+                              const spel_model *draft) {
+    unsigned long long tb = (unsigned long long)target->n_params * sizeof(float);
+    printf("  target params: %zu  FP32: %llu bytes (%.2f MiB)\n",
+           target->n_params, tb, (double)tb / 1048576.0);
+    if (draft) {
+        unsigned long long db = (unsigned long long)draft->n_params * sizeof(float);
+        printf("  draft params: %zu  FP32: %llu bytes (%.2f MiB)\n",
+               draft->n_params, db, (double)db / 1048576.0);
+    }
+    struct stat st;
+    if (stat(path, &st) == 0)
+        printf("  file: %lld bytes (%.2f MiB)\n",
+               (long long)st.st_size, (double)st.st_size / 1048576.0);
 }
 
 /* Returns 1 if loaded, 0 if no file, -1 on failure. */
@@ -710,10 +878,10 @@ static void prefill_chunks(spel_model *m, const int *toks, int n) {
     }
 }
 
-static void bench_verify(void) {
-    printf("[B2] verification cost (d=384, 12 layers, 9 GDN + 3 attn)\n");
-    spel_cfg c;
-    spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, 16);
+static void bench_verify(const spel_cfg *base) {
+    spel_cfg c = *base;
+    printf("[B2] verification cost (d=%d, %d layers, %d GDN + %d attn)\n",
+           c.d_model, c.n_layers, c.n_linear, c.n_attn);
     spel_model *t = spel_model_new(&c, 31337);
     uint64_t rng = 8;
     int prompt[64];
@@ -772,24 +940,27 @@ static void prepare_pair(spel_model *target, spel_model *draft,
     }
 }
 
-static void bench_decode(void) {
-    printf("[B3] decode throughput (12 layers, d=384, 9 GDN + 3 attn)\n");
-    int K = 16;
+static void bench_decode(const spel_cfg *base) {
+    spel_cfg c = *base;
+    int K = c.spec_k;
     const char *ks = getenv("SPEL_BENCH_K");
     if (ks) {
         int v = atoi(ks);
         if (v >= 1 && v <= SPEL_MAX_BATCH) K = v;
     }
-    spel_cfg c;
-    spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, K);
+    c.spec_k = K;
+    printf("[B3] decode throughput (%d layers, d=%d, %d GDN + %d attn, K=%d)\n",
+           c.n_layers, c.d_model, c.n_linear, c.n_attn, K);
     spel_model *target = spel_model_new(&c, 31337);
 
-    int map[4] = {0, 3, 6, 9}; /* 3 recurrent + 1 attention layer */
+    int map[4];
+    memcpy(map, c.draft_map, sizeof(map));
     double tq = spel_now_ms();
     spel_model *draft = spel_model_new_draft_subset(target, map, 4);
     tq = spel_now_ms() - tq;
     if (!draft) { printf("  draft alloc failed\n"); spel_model_free(target); return; }
-    printf("  draft: 4 of 12 layers, MLP-only ternary (2-bit), built in %.1f ms\n", tq);
+    printf("  draft: 4 of %d layers, MLP-only ternary (2-bit), built in %.1f ms\n",
+           c.n_layers, tq);
     if (load_weights_pair_if_available(target, draft) < 0) {
         spel_model_free(draft); spel_model_free(target); return;
     }
@@ -819,7 +990,9 @@ static void bench_decode(void) {
     /* Fast verification cost for the K+1 batch. The target path is unchanged
      * by the draft pool, so this v applies to both thread settings. */
     spel_ckpt_load(target, cp_t);
-    int vtoks[17] = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2};
+    int vtoks[SPEL_MAX_BATCH + 1];
+    const int vseed[17] = {3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2};
+    for (int i = 0; i < K + 1; i++) vtoks[i] = vseed[i];
     spel_use_accelerate = 1;
     spel_forward(target, vtoks, K + 1, NULL); /* warm */
     int viters = 24;
@@ -963,8 +1136,8 @@ static void bench_decode(void) {
         printf("  raw t=%d rounds=%ld proposed=%ld accepted=%ld\n",
                thread_counts[ti], st[ti].rounds, st[ti].proposed, st[ti].accepted);
 
-    /* Reference: full 12-layer FP32 copy of the target as draft. This is not
-     * the cheap-draft system ceiling; it shows why a target-sized draft cannot
+    /* Reference: full FP32 copy of the target as draft. This is not the
+     * cheap-draft system ceiling; it shows why a target-sized draft cannot
      * speculatively draft for itself even at 100% acceptance. */
     spel_model *oracle = spel_model_new(&c, 31337);
     if (!oracle) { printf("  oracle alloc failed\n"); }
@@ -991,8 +1164,9 @@ static void bench_decode(void) {
         t0 = spel_now_ms();
         spel_spec_generate(target, oracle, gen, out, &sc, &st_or);
         double or_ms = spel_now_ms() - t0;
-        printf("  spec oracle-12L (full copy): %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
-               gen / (or_ms / 1000.0), (gen / (or_ms / 1000.0)) / ar_tps,
+        printf("  spec oracle-%dL (full copy): %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
+               c.n_layers, gen / (or_ms / 1000.0),
+               (gen / (or_ms / 1000.0)) / ar_tps,
                st_or.alpha, st_or.tokens_per_round);
         spel_ckpt_free(cp_o);
         spel_model_free(oracle);
@@ -1025,13 +1199,14 @@ static void bench_decode(void) {
     spel_ckpt_free(cp_d);
 }
 
-static void run_bench(void) {
+static void run_bench(const spel_cfg *cfg) {
     printf("== SPEL benchmarks ==\n");
+    print_cfg(cfg);
     bench_ternary();
     printf("\n");
-    bench_verify();
+    bench_verify(cfg);
     printf("\n");
-    bench_decode();
+    bench_decode(cfg);
 }
 
 int main(int argc, char **argv) {
@@ -1049,23 +1224,28 @@ int main(int argc, char **argv) {
         printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASS", failures);
         return failures ? 1 : 0;
     } else if (!strcmp(cmd, "bench")) {
-        run_bench();
+        spel_cfg c;
+        if (build_run_cfg(argc, argv, 2, &c)) return 2;
+        run_bench(&c);
         return 0;
     } else if (!strcmp(cmd, "verify-weights")) {
         if (argc < 3) {
-            printf("usage: %s verify-weights <path>\n", argv[0]);
+            printf("usage: %s verify-weights <path> [--config key=value,...]\n", argv[0]);
             return 2;
         }
         spel_cfg c;
-        spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, 16);
+        if (build_run_cfg(argc, argv, 3, &c)) return 2;
+        print_cfg(&c);
         spel_model *target = spel_model_new(&c, 31337);
-        int map[4] = {0, 3, 6, 9};
+        int map[4];
+        memcpy(map, c.draft_map, sizeof(map));
         spel_model *draft = spel_model_new_draft_subset(target, map, 4);
         if (!target || !draft) {
             printf("model alloc failed\n");
             spel_model_free(target); spel_model_free(draft);
             return 1;
         }
+        print_weight_info(argv[2], target, draft);
         int v = spel_verify_weights(target, draft, argv[2]);
         spel_model_free(draft); spel_model_free(target);
         return v == 0 ? 0 : 1;
@@ -1079,7 +1259,7 @@ int main(int argc, char **argv) {
                r.matched, r.n, r.st.alpha, r.st.tokens_per_round);
         return failures ? 1 : 0;
     } else {
-        printf("usage: %s [selftest|bench|demo|verify-weights <path>]\n", argv[0]);
+        printf("usage: %s [selftest|bench [--config k=v,...]|demo|verify-weights <path> [--config k=v,...]]\n", argv[0]);
         return 2;
     }
 }

@@ -570,6 +570,10 @@ def export_weights(teacher: SpelModel, student: SpelModel, cfg: SpelConfig,
     # Golden is generated on CPU in float32 so the file is device-independent.
     teacher_cpu = teacher.to("cpu")
     student_cpu = student.to("cpu")
+    n_params = sum(p.numel() for p in teacher_cpu.parameters())
+    fp32_bytes = n_params * 4
+    print(f"[export] target params={n_params:,}  "
+          f"FP32={fp32_bytes} bytes ({fp32_bytes / 1048576:.2f} MiB)")
     tokens, gt, gs = golden_logits(teacher_cpu, student_cpu, cfg)
 
     # header: 8-byte magic + 14 u32 = 64 bytes.  The last u32 is
@@ -651,6 +655,23 @@ def parse_args():
     p.add_argument("--steps-qat", type=int, default=1200)
     p.add_argument("--out", type=str, default="weights/spel.bin")
     p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--d-model", type=int, default=384,
+                   help="target width (C limit: 1024)")
+    p.add_argument("--n-layers", type=int, default=12,
+                   help="target depth (C limit: 16)")
+    p.add_argument("--n-heads", type=int, default=6,
+                   help="attention/head count (C limit: 16)")
+    p.add_argument("--head-dim", type=int, default=0,
+                   help="optional check; must equal d_model/n_heads")
+    p.add_argument("--d-ff", type=int, default=1024,
+                   help="SwiGLU width (C limit: 4096)")
+    p.add_argument("--vocab", type=int, default=128,
+                   help="token vocabulary (C limit: 1024)")
+    p.add_argument("--attn-period", type=int, default=4,
+                   help="every Nth target layer is attention")
+    p.add_argument("--max-seq", type=int, default=512)
+    p.add_argument("--draft-map", type=str, default="0,3,6,9",
+                   help="four target layer indices used by the distilled draft")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=384)
     p.add_argument("--pool-size", type=int, default=2048)
@@ -670,13 +691,52 @@ def parse_args():
 
 
 def main():
+    global CFG
     args = parse_args()
     if args.seq_len < 32:
         raise SystemExit("--seq-len must be >= 32")
+    try:
+        draft_map = tuple(int(x) for x in args.draft_map.split(","))
+    except ValueError:
+        raise SystemExit("--draft-map must be four comma-separated integers")
+    if len(draft_map) != 4:
+        raise SystemExit("--draft-map must contain exactly four integers")
+    CFG = SpelConfig(
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        d_ff=args.d_ff,
+        vocab=args.vocab,
+        max_seq=args.max_seq,
+        attn_period=args.attn_period,
+        draft_map=draft_map,
+    )
+    if not (1 <= CFG.n_layers <= 16):
+        raise SystemExit("--n-layers must be in 1..16 for the C runtime")
+    if not (1 <= CFG.d_model <= 1024):
+        raise SystemExit("--d-model must be in 1..1024 for the C runtime")
+    if not (1 <= CFG.n_heads <= 16):
+        raise SystemExit("--n-heads must be in 1..16 for the C runtime")
+    if CFG.d_model % CFG.n_heads:
+        raise SystemExit("--d-model must be divisible by --n-heads")
+    if args.head_dim and args.head_dim != CFG.head_dim:
+        raise SystemExit("--head-dim must equal d_model // n_heads")
+    if not (1 <= CFG.d_ff <= 4096):
+        raise SystemExit("--d-ff must be in 1..4096 for the C runtime")
+    if not (1 <= CFG.vocab <= 1024):
+        raise SystemExit("--vocab must be in 1..1024 for the C runtime")
+    if not (1 <= CFG.max_seq <= 4096):
+        raise SystemExit("--max-seq must be in 1..4096 for the C runtime")
+    if CFG.attn_period < 2:
+        raise SystemExit("--attn-period must be >= 2")
+    if any(src < 0 or src >= CFG.n_layers for src in CFG.draft_map):
+        raise SystemExit("--draft-map indices must be inside the target depth")
+
     device = pick_device(args.device)
     print(f"== SPEL training/QAT on {device} ==")
     print(f"   config: d={CFG.d_model} layers={CFG.n_layers} heads={CFG.n_heads} "
-          f"d_ff={CFG.d_ff} vocab={CFG.vocab} seq={args.seq_len}")
+          f"head_dim={CFG.head_dim} d_ff={CFG.d_ff} vocab={CFG.vocab} "
+          f"seq={args.seq_len} max_seq={CFG.max_seq}")
     print(f"   draft: 4 layers {CFG.draft_map}, q8 wqkv/wo + ternary MLP + QAT")
 
     random.seed(args.seed)
