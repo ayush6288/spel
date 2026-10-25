@@ -3,4 +3,7 @@ spel
 .DS_Store
 results/
 .venv/
+weights/
+__pycache__/
+*.pyc
 *.dSYM/

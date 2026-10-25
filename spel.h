@@ -102,14 +102,26 @@ typedef struct {
     q8_mat q_wqkv, q_wo;  /* optional int8 projections (draft) */
 } spel_layer;
 
-typedef struct {
+typedef struct spel_model {
     spel_cfg cfg;
-    int owns_params;
+    int owns_params;        /* target: params holds shared + layer tensors */
+    int owns_layer_params;  /* draft: params holds only this model's layers */
     float *params;
     size_t n_params;
     float *emb, *wout, *normf;      /* [vocab][d], [vocab][d], [d] */
     float *rope_cos, *rope_sin;     /* [max_seq][dh/2] */
     spel_layer layer[SPEL_MAX_LAYERS];
+
+    /* draft provenance (serialized in SPELW001) */
+    int n_draft_layers;
+    int source_map[4];
+    struct spel_model *draft;       /* non-owning, for save-by-pair convenience */
+
+    /* optional golden footer from SPELW001/SPELV001 */
+    int golden_len;
+    int32_t golden_tokens[16];
+    float *golden_target_logits;    /* [golden_len][vocab] */
+    float *golden_draft_logits;
 
     /* runtime state (per model instance) */
     float *kv_k[SPEL_MAX_LAYERS], *kv_v[SPEL_MAX_LAYERS];
@@ -131,11 +143,37 @@ typedef struct {
 spel_model *spel_model_new(const spel_cfg *cfg, uint64_t seed);
 spel_model *spel_model_new_draft(const spel_model *target);
 /* Draft from a subset of target layers. layer_map[i] is the source layer for
- * draft layer i. Non-MLP weights are shared; MLPs are ternary copies. */
+ * draft layer i. The draft owns independent FP32 copies of those layers'
+ * parameters (initialized from the target) and quantizes its q8 projections
+ * and ternary MLPs. Embedding, final norm, LM head and RoPE are shared. */
 spel_model *spel_model_new_draft_subset(const spel_model *target,
                                         const int *layer_map, int n_layers);
 void        spel_model_free(spel_model *m);
 void        spel_model_reset(spel_model *m);
+/* Non-owning link used by spel_save_weights(m, path). */
+void        spel_model_attach_draft(spel_model *target, spel_model *draft);
+
+/* ------------------------------------------------ binary weights SPELW001 */
+/* Header: 8-byte magic "SPELW001", u32 version=1, d_model, n_layers, n_heads,
+ * head_dim, d_ff, vocab, attn_period, n_draft_layers, draft_map[4],
+ * has_golden_footer. All integers/floats are little-endian. Tensor order:
+ *   emb, target layer 0..N-1, normf, wout,
+ *   4 draft layers, optional SPELV001 footer.
+ * Per layer: n1, wqkv, wo, [conv, wa, wb if linear], n2, w1, w3, w2. */
+#define SPEL_WEIGHTS_MAGIC "SPELW001"
+#define SPEL_GOLDEN_MAGIC  "SPELV001"
+#define SPEL_GOLDEN_LEN    16
+
+int spel_save_weights(const spel_model *m, const char *path);
+int spel_load_weights(spel_model *m, const char *path);
+/* Explicit target+draft variants used by the CLI/bench loader. */
+int spel_save_weights_pair(const spel_model *target, const spel_model *draft,
+                           const char *path);
+int spel_load_weights_pair(spel_model *target, spel_model *draft,
+                           const char *path);
+/* Load a pair, run the SPELV001 golden tokens, print max-abs and argmax
+ * agreement. Returns 0 when target argmax is 100% and max_diff < 1e-3. */
+int spel_verify_weights(spel_model *target, spel_model *draft, const char *path);
 
 /* Capture buffers are indexed by absolute position: [pos][channel][dh]. */
 int  spel_capture_alloc(spel_model *m, int max_pos);
@@ -202,6 +240,11 @@ typedef struct {
     int governor;          /* enable dynamic governor */
     double alpha_threshold;/* default 0.30 */
     int window;            /* acceptance rolling window */
+    /* Benchmark-only. If >= 0, ignore real draft/target matches and force the
+     * accepted-prefix length to round(alpha*K) on average. The draft and target
+     * forwards still execute normally, so this measures systems cost at a
+     * chosen acceptance rate; it is not real speculative decoding. */
+    double force_alpha;
 } spel_spec_cfg;
 
 typedef struct {

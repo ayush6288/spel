@@ -16,6 +16,31 @@ static float frand(uint64_t *rng) { return (float)(spel_rng_double(rng) * 2.0 - 
 
 static uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 
+static int file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+static const char *weights_path(void) {
+    const char *p = getenv("SPEL_WEIGHTS");
+    if (p && p[0]) return p;
+    if (file_exists("weights/spel.bin")) return "weights/spel.bin";
+    return NULL;
+}
+
+/* Returns 1 if loaded, 0 if no file, -1 on failure. */
+static int load_weights_pair_if_available(spel_model *target, spel_model *draft) {
+    const char *p = weights_path();
+    if (!p) return 0;
+    if (spel_load_weights_pair(target, draft, p)) {
+        printf("[weights] failed to load %s (config or magic mismatch)\n", p);
+        return -1;
+    }
+    printf("[weights] loaded %s\n", p);
+    return 1;
+}
+
 /* --------------------------------------------------------- ternary test */
 
 static void test_ternary(void) {
@@ -185,7 +210,126 @@ static void test_spec(void) {
     CHECK(r.st.governor_trips > 0, "K=16 governor never tripped");
 }
 
-/* -------------------------------------------------------- fast math test */
+/* -------------------------------------------------------- forced bench */
+
+static void test_forced_acceptance(void) {
+    printf("[6] forced-acceptance benchmark path (not real decoding)\n");
+    spel_cfg c;
+    spel_cfg_init(&c, 128, 8, 4, 256, 64, 256, 4, 8);
+    spel_model *target = spel_model_new(&c, 2026);
+    int map[4] = {0, 2, 4, 6};
+    spel_model *draft = spel_model_new_draft_subset(target, map, 4);
+    if (!draft) { CHECK(0, "draft alloc failed"); spel_model_free(target); return; }
+
+    uint64_t rng = 31;
+    int prompt[16];
+    fill_tokens(prompt, 16, c.vocab, &rng);
+    spel_model_reset(target); spel_model_reset(draft);
+    spel_forward(target, prompt, 16, NULL);
+    spel_forward(draft, prompt, 16, NULL);
+    const int start = target->pos;
+    spel_ckpt *cp_t = spel_ckpt_new(target);
+    spel_ckpt *cp_d = spel_ckpt_new(draft);
+
+    const int gen = 32;
+    int out[32];
+    const double alphas[2] = {0.75, 1.00};
+    for (int a = 0; a < 2; a++) {
+        spel_ckpt_load(target, cp_t);
+        spel_ckpt_load(draft, cp_d);
+        spel_spec_cfg sc; spel_spec_cfg_default(&sc, 8);
+        sc.governor = 0;
+        sc.force_alpha = alphas[a];
+        spel_spec_stats st;
+        spel_spec_generate(target, draft, gen, out, &sc, &st);
+        CHECK(st.emitted == gen, "alpha=%.2f emitted=%ld/%d", alphas[a], st.emitted, gen);
+        CHECK(fabs(st.alpha - alphas[a]) < 1e-9,
+              "alpha=%.2f stats alpha=%.3f", alphas[a], st.alpha);
+        CHECK(target->pos == start + gen, "alpha=%.2f target pos=%d expected=%d",
+              alphas[a], target->pos, start + gen);
+        CHECK(draft->pos == target->pos, "alpha=%.2f draft pos=%d target pos=%d",
+              alphas[a], draft->pos, target->pos);
+        int bad = 0;
+        for (int i = 0; i < gen; i++) if (out[i] < 0 || out[i] >= c.vocab) bad++;
+        CHECK(bad == 0, "alpha=%.2f %d invalid output tokens", alphas[a], bad);
+        printf("  alpha=%.2f: emitted=%ld accepted=%ld/%ld alpha=%.3f %.2f tok/round\n",
+               alphas[a], st.emitted, st.accepted, st.proposed, st.alpha,
+               st.tokens_per_round);
+    }
+
+    spel_ckpt_free(cp_t);
+    spel_ckpt_free(cp_d);
+    spel_model_free(draft);
+    spel_model_free(target);
+}
+
+
+/* ------------------------------------------------------ weight round-trip */
+
+static int layers_equal(const spel_model *a, const spel_model *b) {
+    const spel_cfg *c = &a->cfg;
+    if (c->n_layers != b->cfg.n_layers) return 0;
+    for (int l = 0; l < c->n_layers; l++) {
+        const spel_layer *x = &a->layer[l], *y = &b->layer[l];
+        if (memcmp(x->n1, y->n1, (size_t)c->d_model * sizeof(float))) return 0;
+        if (memcmp(x->n2, y->n2, (size_t)c->d_model * sizeof(float))) return 0;
+        if (memcmp(x->wqkv, y->wqkv, (size_t)3 * c->d_model * c->d_model * sizeof(float))) return 0;
+        if (memcmp(x->wo, y->wo, (size_t)c->d_model * c->d_model * sizeof(float))) return 0;
+        if (memcmp(x->w1, y->w1, (size_t)c->d_model * c->d_ff * sizeof(float))) return 0;
+        if (memcmp(x->w3, y->w3, (size_t)c->d_model * c->d_ff * sizeof(float))) return 0;
+        if (memcmp(x->w2, y->w2, (size_t)c->d_ff * c->d_model * sizeof(float))) return 0;
+        if (c->is_linear[l]) {
+            if (memcmp(x->conv, y->conv, (size_t)c->conv_k * c->d_model * sizeof(float))) return 0;
+            if (memcmp(x->wa, y->wa, (size_t)c->n_heads * sizeof(float))) return 0;
+            if (memcmp(x->wb, y->wb, (size_t)c->n_heads * sizeof(float))) return 0;
+        }
+    }
+    return 1;
+}
+
+static void test_weights_roundtrip(void) {
+    printf("[7] SPELW001 save/load round-trip + SPELV001 golden verify\n");
+    spel_cfg c;
+    spel_cfg_init(&c, 128, 8, 4, 256, 128, 512, 4, 4);
+    spel_model *t0 = spel_model_new(&c, 777);
+    int map[4] = {0, 3, 5, 7};
+    spel_model *d0 = spel_model_new_draft_subset(t0, map, 4);
+    spel_model *t1 = spel_model_new(&c, 888);
+    spel_model *d1 = spel_model_new_draft_subset(t1, map, 4);
+    if (!t0 || !d0 || !t1 || !d1) {
+        CHECK(0, "weight test allocation failed");
+        spel_model_free(t0); spel_model_free(d0);
+        spel_model_free(t1); spel_model_free(d1);
+        return;
+    }
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !tmp[0]) tmp = ".";
+    char path[512];
+    snprintf(path, sizeof(path), "%s/spel_weights_selftest.bin", tmp);
+    spel_model_attach_draft(t0, d0);
+    spel_model_attach_draft(t1, d1);
+    int saved = spel_save_weights(t0, path);
+    CHECK(saved == 0, "save failed (%d) at %s", saved, path);
+    if (saved == 0) {
+        int loaded = spel_load_weights(t1, path);
+        CHECK(loaded == 0, "load failed (%d)", loaded);
+        if (loaded == 0) {
+            CHECK(memcmp(t0->emb, t1->emb, (size_t)c.vocab * c.d_model * sizeof(float)) == 0,
+                  "target embedding differs");
+            CHECK(memcmp(t0->normf, t1->normf, (size_t)c.d_model * sizeof(float)) == 0,
+                  "target final norm differs");
+            CHECK(memcmp(t0->wout, t1->wout, (size_t)c.vocab * c.d_model * sizeof(float)) == 0,
+                  "target LM head differs");
+            CHECK(layers_equal(t0, t1), "target layer weights differ");
+            CHECK(layers_equal(d0, d1), "draft layer weights differ");
+            int v = spel_verify_weights(t1, d1, path);
+            CHECK(v == 0, "golden verifier failed (%d)", v);
+        }
+    }
+    remove(path);
+    spel_model_free(t0); spel_model_free(d0);
+    spel_model_free(t1); spel_model_free(d1);
+}
 
 static void test_fast_mode(void) {
     printf("[5] Accelerate fast path: token equivalence (not bitwise)\n");
@@ -267,9 +411,27 @@ static int rank_of(const float *logits, int V, int tok) {
 
 static void test_notebank(int with_spec) {
     printf("[4] NoteBank writer / addressing / replay\n");
+    const char *wpath = with_spec ? weights_path() : NULL;
     spel_cfg c;
-    spel_cfg_init(&c, 128, 8, 4, 256, 128, 512, 4, 4);
+    if (wpath)
+        spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, 16);
+    else
+        spel_cfg_init(&c, 128, 8, 4, 256, 128, 512, 4, 4);
     spel_model *m = spel_model_new(&c, 2024);
+    spel_model *draft = NULL;
+    if (with_spec) {
+        int map[4] = {0, 3, 5, 7};
+        if (wpath) { map[0] = 0; map[1] = 3; map[2] = 6; map[3] = 9; }
+        draft = spel_model_new_draft_subset(m, map, 4);
+        if (draft && wpath) {
+            if (spel_load_weights_pair(m, draft, wpath)) {
+                printf("[weights] failed to load %s\n", wpath);
+                spel_model_free(draft); spel_model_free(m);
+                return;
+            }
+            printf("[weights] loaded %s\n", wpath);
+        }
+    }
     spel_model_reset(m);
     spel_capture_alloc(m, c.max_seq);
 
@@ -370,8 +532,6 @@ static void test_notebank(int with_spec) {
         /* Branch S_T -> addressing -> restore S_T -> replay -> speculative
          * generation. Replay is still token re-prefill, not native state
          * injection; this only proves the integration path. */
-        int map[4] = {0, 3, 5, 7};
-        spel_model *draft = spel_model_new_draft_subset(m, map, 4);
         if (draft) {
             spel_model_reset(draft);
             for (int i = 0; i < T; i += c.spec_k) {
@@ -406,7 +566,6 @@ static void test_notebank(int with_spec) {
             printf("  alpha=%.3f trips=%ld AR=%ld\n",
                    st.alpha, st.governor_trips, st.ar_rounds);
             spel_ckpt_free(cp_d);
-            spel_model_free(draft);
         } else {
             printf("  NoteBank->spec: draft alloc failed\n");
         }
@@ -424,6 +583,7 @@ static void test_notebank(int with_spec) {
     free(ctx);
     spel_ckpt_free(cp);
     spel_capture_free(m);
+    spel_model_free(draft);
     spel_model_free(m);
 }
 
@@ -576,6 +736,10 @@ static void bench_decode(void) {
     tq = spel_now_ms() - tq;
     if (!draft) { printf("  draft alloc failed\n"); spel_model_free(target); return; }
     printf("  draft: 4 of 12 layers, MLP-only ternary (2-bit), built in %.1f ms\n", tq);
+    if (load_weights_pair_if_available(target, draft) < 0) {
+        spel_model_free(draft); spel_model_free(target); return;
+    }
+    int weights_loaded = weights_path() != NULL;
 
     uint64_t rng = 8;
     int prompt[64];
@@ -583,7 +747,7 @@ static void bench_decode(void) {
     const int gen = 64, warm_n = 8;
     int warm[8];
     int *out = (int *)malloc((size_t)gen * sizeof(int));
-    double ar_ms, dr_ms, sp_ms, gov_ms, or_ms;
+    double ar_ms, dr_ms, sp_ms, gov_ms;
 
     prepare_pair(target, draft, prompt, 64, warm_n, warm);
     spel_ckpt *cp_t = spel_ckpt_new(target);
@@ -648,20 +812,34 @@ static void bench_decode(void) {
     spel_spec_generate(target, draft, gen, out, &sc, &st_gov);
     gov_ms = spel_now_ms() - t0;
 
-    /* Oracle: full FP32 copy of the target as draft. This is the runtime-cost
-     * upper bound; it still pays one full target token per proposal. */
-    spel_model *oracle = spel_model_new(&c, 31337);
-    prepare_pair(target, oracle, prompt, 64, warm_n, warm);
-    spel_ckpt_save(cp_t, target);
-    spel_ckpt *cp_o = spel_ckpt_new(oracle);
-    spel_use_accelerate = 1; /* oracle spec must use the fast verification path */
+    /* Benchmark-only forced-acceptance oracle. This is the same 4-layer
+     * q8/ternary draft as the raw/governed rows and the same M=17 Accelerate
+     * verification batch. Every draft and target forward still executes; only
+     * the accepted-prefix decision m is forced to alpha*K. It measures systems
+     * throughput at a hypothetical acceptance rate, not untrained model quality. */
     sc.governor = 0;
-    spel_spec_generate(target, oracle, warm_n, out, &sc, &st_or); /* warm */
-    spel_ckpt_load(target, cp_t);
-    spel_ckpt_load(oracle, cp_o);
-    t0 = spel_now_ms();
-    spel_spec_generate(target, oracle, gen, out, &sc, &st_or);
-    or_ms = spel_now_ms() - t0;
+    const double forced_alpha[2] = {0.75, 1.00};
+    double forced_ms[2] = {0.0, 0.0};
+    spel_spec_stats forced_st[2];
+    for (int a = 0; a < 2; a++) {
+        sc.force_alpha = forced_alpha[a];
+        spel_ckpt_load(target, cp_t);
+        spel_ckpt_load(draft, cp_d);
+        spel_spec_generate(target, draft, warm_n, out, &sc, &forced_st[a]); /* warm */
+        double reps[3];
+        for (int r = 0; r < 3; r++) {
+            spel_ckpt_load(target, cp_t);
+            spel_ckpt_load(draft, cp_d);
+            t0 = spel_now_ms();
+            spel_spec_generate(target, draft, gen, out, &sc, &forced_st[a]);
+            reps[r] = spel_now_ms() - t0;
+        }
+        if (reps[0] > reps[1]) { double x = reps[0]; reps[0] = reps[1]; reps[1] = x; }
+        if (reps[1] > reps[2]) { double x = reps[1]; reps[1] = reps[2]; reps[2] = x; }
+        if (reps[0] > reps[1]) { double x = reps[0]; reps[0] = reps[1]; reps[1] = x; }
+        forced_ms[a] = reps[1]; /* median of 3 */
+    }
+    sc.force_alpha = -1.0;
 
     double ar_tps = gen / (ar_ms / 1000.0);
     double c_draft = dr_ms / ar_ms;
@@ -677,16 +855,56 @@ static void bench_decode(void) {
     printf("  spec K=%d gov : %7.1f tok/s  (%.2fx AR)  alpha=%.3f  trips=%ld AR-rounds=%ld\n",
            K, gen / (gov_ms / 1000.0), (gen / (gov_ms / 1000.0)) / ar_tps,
            st_gov.alpha, st_gov.governor_trips, st_gov.ar_rounds);
-    printf("  spec K=%d orac: %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
-           K, gen / (or_ms / 1000.0), (gen / (or_ms / 1000.0)) / ar_tps,
-           st_or.alpha, st_or.tokens_per_round);
+    printf("  spec oracle-4L (alpha=0.75): %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
+           gen / (forced_ms[0] / 1000.0),
+           (gen / (forced_ms[0] / 1000.0)) / ar_tps,
+           forced_st[0].alpha, forced_st[0].tokens_per_round);
+    printf("  spec oracle-4L (alpha=1.00): %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
+           gen / (forced_ms[1] / 1000.0),
+           (gen / (forced_ms[1] / 1000.0)) / ar_tps,
+           forced_st[1].alpha, forced_st[1].tokens_per_round);
 
     double proj75 = (1.0 + 0.75 * K) / ((K + 1) * c_draft + v);
-    double proj80 = (1.0 + 0.80 * K) / ((K + 1) * c_draft + v);
-    printf("  projected @ alpha=.75: %.2fx   @ alpha=.80: %.2fx  "
-           "(K=%d, c=%.2f, v=%.2f)\n", proj75, proj80, K, c_draft, v);
+    double proj100 = (1.0 + 1.00 * K) / ((K + 1) * c_draft + v);
+    printf("  projected    : a=.75 %.2fx  a=1.00 %.2fx  "
+           "(K=%d, c=%.2f, v=%.2f)\n", proj75, proj100, K, c_draft, v);
     printf("  raw rounds=%ld proposed=%ld accepted=%ld\n",
            st.rounds, st.proposed, st.accepted);
+
+    /* Reference: full 12-layer FP32 copy of the target as draft. This is not
+     * the cheap-draft system ceiling; it shows why a target-sized draft cannot
+     * speculatively draft for itself even at 100% acceptance. */
+    spel_model *oracle = spel_model_new(&c, 31337);
+    if (!oracle) { printf("  oracle alloc failed\n"); }
+    else {
+        if (weights_loaded) {
+            const char *wp = weights_path();
+            if (!wp || spel_load_weights(oracle, wp)) {
+                printf("  oracle weight load failed\n");
+                spel_model_free(oracle);
+                oracle = NULL;
+            }
+        }
+    }
+    if (oracle) {
+        prepare_pair(target, oracle, prompt, 64, warm_n, warm);
+        spel_ckpt_save(cp_t, target);
+        spel_ckpt *cp_o = spel_ckpt_new(oracle);
+        spel_use_accelerate = 1;
+        sc.governor = 0;
+        sc.force_alpha = -1.0;
+        spel_spec_generate(target, oracle, warm_n, out, &sc, &st_or); /* warm */
+        spel_ckpt_load(target, cp_t);
+        if (cp_o) spel_ckpt_load(oracle, cp_o);
+        t0 = spel_now_ms();
+        spel_spec_generate(target, oracle, gen, out, &sc, &st_or);
+        double or_ms = spel_now_ms() - t0;
+        printf("  spec oracle-12L (full copy): %7.1f tok/s  (%.2fx AR)  alpha=%.3f  (%.2f tok/round)\n",
+               gen / (or_ms / 1000.0), (gen / (or_ms / 1000.0)) / ar_tps,
+               st_or.alpha, st_or.tokens_per_round);
+        spel_ckpt_free(cp_o);
+        spel_model_free(oracle);
+    }
 
     /* O(1) rollback vs KV memcpy */
     size_t kvb = spel_kv_bytes(&c);
@@ -709,8 +927,6 @@ static void bench_decode(void) {
 
     spel_use_accelerate = 0;
     free(a); free(bb); free(out);
-    spel_ckpt_free(cp_o);
-    spel_model_free(oracle);
     spel_model_free(draft);
     spel_model_free(target);
     spel_ckpt_free(cp_t);
@@ -735,11 +951,31 @@ int main(int argc, char **argv) {
         test_spec();
         test_notebank(0);
         test_fast_mode();
+        test_forced_acceptance();
+        test_weights_roundtrip();
         printf("\n%s (%d failures)\n", failures ? "FAILED" : "PASS", failures);
         return failures ? 1 : 0;
     } else if (!strcmp(cmd, "bench")) {
         run_bench();
         return 0;
+    } else if (!strcmp(cmd, "verify-weights")) {
+        if (argc < 3) {
+            printf("usage: %s verify-weights <path>\n", argv[0]);
+            return 2;
+        }
+        spel_cfg c;
+        spel_cfg_init(&c, 384, 12, 6, 1024, 128, 512, 4, 16);
+        spel_model *target = spel_model_new(&c, 31337);
+        int map[4] = {0, 3, 6, 9};
+        spel_model *draft = spel_model_new_draft_subset(target, map, 4);
+        if (!target || !draft) {
+            printf("model alloc failed\n");
+            spel_model_free(target); spel_model_free(draft);
+            return 1;
+        }
+        int v = spel_verify_weights(target, draft, argv[2]);
+        spel_model_free(draft); spel_model_free(target);
+        return v == 0 ? 0 : 1;
     } else if (!strcmp(cmd, "demo")) {
         printf("== SPEL demo: NoteBank + SubTernary on Apple M5 ==\n");
         test_notebank(1);
@@ -750,7 +986,7 @@ int main(int argc, char **argv) {
                r.matched, r.n, r.st.alpha, r.st.tokens_per_round);
         return failures ? 1 : 0;
     } else {
-        printf("usage: %s [selftest|bench|demo]\n", argv[0]);
+        printf("usage: %s [selftest|bench|demo|verify-weights <path>]\n", argv[0]);
         return 2;
     }
 }

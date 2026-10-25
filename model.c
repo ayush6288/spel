@@ -247,6 +247,16 @@ spel_model *spel_model_new(const spel_cfg *cfg, uint64_t seed) {
     return m;
 }
 
+static size_t layer_tensor_count(const spel_cfg *c, int is_linear) {
+    size_t n = (size_t)3 * c->d_model * c->d_model   /* wqkv */
+             + (size_t)c->d_model * c->d_model       /* wo   */
+             + (size_t)3 * c->d_model * c->d_ff      /* w1,w3,w2 */
+             + (size_t)2 * c->d_model;               /* n1,n2 */
+    if (is_linear)
+        n += (size_t)c->conv_k * c->d_model + (size_t)2 * c->n_heads;
+    return n;
+}
+
 spel_model *spel_model_new_draft_subset(const spel_model *t,
                                         const int *layer_map, int n_layers) {
     if (!t || !layer_map || n_layers <= 0 ||
@@ -257,44 +267,74 @@ spel_model *spel_model_new_draft_subset(const spel_model *t,
     m->cfg = t->cfg;
     m->cfg.n_layers = n_layers;
     m->cfg.n_linear = m->cfg.n_attn = 0;
+    size_t np = 0;
     for (int l = 0; l < n_layers; l++) {
         int src = layer_map[l];
         if (src < 0 || src >= t->cfg.n_layers) { free(m); return NULL; }
-        m->layer[l] = t->layer[src];
         int is_attn = !t->cfg.is_linear[src];
         m->cfg.is_linear[l] = !is_attn;
         m->cfg.lin_index[l] = is_attn ? -1 : m->cfg.n_linear++;
         m->cfg.attn_index[l] = is_attn ? m->cfg.n_attn++ : -1;
+        np += layer_tensor_count(&t->cfg, !is_attn);
     }
     m->cfg.n_channels = m->cfg.n_linear * m->cfg.n_heads;
-    m->owns_params = 0;
+
+    m->params = (float *)calloc(np, sizeof(float));
+    if (!m->params) { free(m); return NULL; }
+    m->n_params = np;
+    m->owns_layer_params = 1;
     m->emb = t->emb; m->wout = t->wout; m->normf = t->normf;
     m->rope_cos = t->rope_cos; m->rope_sin = t->rope_sin;
     m->is_ternary = 1;
     m->rng = t->rng ^ 0xA5A5A5A55A5A5A5AULL;
-    alloc_runtime(m);
-    if (!m->buf || !m->last_logits) { spel_model_free(m); return NULL; }
+    m->n_draft_layers = n_layers <= 4 ? n_layers : 0;
+    for (int l = 0; l < m->n_draft_layers; l++) m->source_map[l] = layer_map[l];
+
     const spel_cfg *c = &m->cfg;
+    const int d = c->d_model;
+    float *p = m->params;
     for (int l = 0; l < n_layers; l++) {
         int src = layer_map[l];
+        const spel_layer *S = &t->layer[src];
         spel_layer *L = &m->layer[l];
-        if (tern_mat_init(&L->t1, c->d_ff, c->d_model) ||
-            tern_mat_init(&L->t3, c->d_ff, c->d_model) ||
-            tern_mat_init(&L->t2, c->d_model, c->d_ff)) {
+        L->wqkv = palloc(&p, (size_t)3 * d * d);
+        L->wo   = palloc(&p, (size_t)d * d);
+        L->w1   = palloc(&p, (size_t)d * c->d_ff);
+        L->w3   = palloc(&p, (size_t)d * c->d_ff);
+        L->w2   = palloc(&p, (size_t)c->d_ff * d);
+        L->n1   = palloc(&p, (size_t)d);
+        L->n2   = palloc(&p, (size_t)d);
+        memcpy(L->wqkv, S->wqkv, (size_t)3 * d * d * sizeof(float));
+        memcpy(L->wo, S->wo, (size_t)d * d * sizeof(float));
+        memcpy(L->w1, S->w1, (size_t)d * c->d_ff * sizeof(float));
+        memcpy(L->w3, S->w3, (size_t)d * c->d_ff * sizeof(float));
+        memcpy(L->w2, S->w2, (size_t)c->d_ff * d * sizeof(float));
+        memcpy(L->n1, S->n1, (size_t)d * sizeof(float));
+        memcpy(L->n2, S->n2, (size_t)d * sizeof(float));
+        if (c->is_linear[l]) {
+            L->conv = palloc(&p, (size_t)c->conv_k * d);
+            L->wa   = palloc(&p, (size_t)c->n_heads);
+            L->wb   = palloc(&p, (size_t)c->n_heads);
+            memcpy(L->conv, S->conv, (size_t)c->conv_k * d * sizeof(float));
+            memcpy(L->wa, S->wa, (size_t)c->n_heads * sizeof(float));
+            memcpy(L->wb, S->wb, (size_t)c->n_heads * sizeof(float));
+        }
+        if (tern_mat_init(&L->t1, c->d_ff, d) ||
+            tern_mat_init(&L->t3, c->d_ff, d) ||
+            tern_mat_init(&L->t2, d, c->d_ff) ||
+            q8_mat_init(&L->q_wqkv, 3 * d, d) ||
+            q8_mat_init(&L->q_wo, d, d)) {
             spel_model_free(m);
             return NULL;
         }
-        tern_quantize_mat(&L->t1, t->layer[src].w1);
-        tern_quantize_mat(&L->t3, t->layer[src].w3);
-        tern_quantize_mat(&L->t2, t->layer[src].w2);
-        if (q8_mat_init(&L->q_wqkv, 3 * c->d_model, c->d_model) ||
-            q8_mat_init(&L->q_wo, c->d_model, c->d_model)) {
-            spel_model_free(m);
-            return NULL;
-        }
-        q8_quantize_mat(&L->q_wqkv, t->layer[src].wqkv);
-        q8_quantize_mat(&L->q_wo, t->layer[src].wo);
+        tern_quantize_mat(&L->t1, L->w1);
+        tern_quantize_mat(&L->t3, L->w3);
+        tern_quantize_mat(&L->t2, L->w2);
+        q8_quantize_mat(&L->q_wqkv, L->wqkv);
+        q8_quantize_mat(&L->q_wo, L->wo);
     }
+    alloc_runtime(m);
+    if (!m->buf || !m->last_logits) { spel_model_free(m); return NULL; }
     m->pos = 0;
     return m;
 }
@@ -319,9 +359,12 @@ void spel_model_free(spel_model *m) {
     if (m->owns_params) {
         free(m->params);
         free(m->rope_cos); free(m->rope_sin);
+    } else if (m->owns_layer_params) {
+        free(m->params);
     }
     free(m->buf); free(m->last_logits);
     free(m->cap_q); free(m->cap_k);
+    free(m->golden_target_logits); free(m->golden_draft_logits);
     free(m);
 }
 
@@ -678,6 +721,404 @@ void spel_ckpt_free(spel_ckpt *cp) {
     free(cp);
 }
 
+/* ---------------------------------------------- binary weights SPELW001 */
+
+void spel_model_attach_draft(spel_model *target, spel_model *draft) {
+    if (target) target->draft = draft;
+}
+
+static int wr_bytes(FILE *f, const void *p, size_t n) {
+    return fwrite(p, 1, n, f) == n ? 0 : -1;
+}
+static int rd_bytes(FILE *f, void *p, size_t n) {
+    return fread(p, 1, n, f) == n ? 0 : -1;
+}
+static int wr_u32(FILE *f, uint32_t v) {
+    uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8),
+                    (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
+    return wr_bytes(f, b, 4);
+}
+static int rd_u32(FILE *f, uint32_t *v) {
+    uint8_t b[4];
+    if (rd_bytes(f, b, 4)) return -1;
+    *v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+         ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return 0;
+}
+static int wr_i32(FILE *f, int32_t v) { return wr_u32(f, (uint32_t)v); }
+static int rd_i32(FILE *f, int32_t *v) {
+    uint32_t u;
+    if (rd_u32(f, &u)) return -1;
+    *v = (int32_t)u;
+    return 0;
+}
+static int wr_f32s(FILE *f, const float *p, size_t n) {
+    return fwrite(p, sizeof(float), n, f) == n ? 0 : -1;
+}
+static int rd_f32s(FILE *f, float *p, size_t n) {
+    return fread(p, sizeof(float), n, f) == n ? 0 : -1;
+}
+
+/* Serialized per-layer order:
+ * n1, wqkv, wo, [conv, wa, wb], n2, w1, w3, w2. */
+static int save_layer(FILE *f, const spel_layer *L, const spel_cfg *c, int l) {
+    const int d = c->d_model, dff = c->d_ff;
+    if (wr_f32s(f, L->n1, (size_t)d)) return -1;
+    if (wr_f32s(f, L->wqkv, (size_t)3 * d * d)) return -1;
+    if (wr_f32s(f, L->wo, (size_t)d * d)) return -1;
+    if (c->is_linear[l]) {
+        if (wr_f32s(f, L->conv, (size_t)c->conv_k * d)) return -1;
+        if (wr_f32s(f, L->wa, (size_t)c->n_heads)) return -1;
+        if (wr_f32s(f, L->wb, (size_t)c->n_heads)) return -1;
+    }
+    if (wr_f32s(f, L->n2, (size_t)d)) return -1;
+    if (wr_f32s(f, L->w1, (size_t)d * dff)) return -1;
+    if (wr_f32s(f, L->w3, (size_t)d * dff)) return -1;
+    if (wr_f32s(f, L->w2, (size_t)dff * d)) return -1;
+    return 0;
+}
+
+static int load_layer(FILE *f, spel_layer *L, const spel_cfg *c, int l) {
+    const int d = c->d_model, dff = c->d_ff;
+    if (rd_f32s(f, L->n1, (size_t)d)) return -1;
+    if (rd_f32s(f, L->wqkv, (size_t)3 * d * d)) return -1;
+    if (rd_f32s(f, L->wo, (size_t)d * d)) return -1;
+    if (c->is_linear[l]) {
+        if (rd_f32s(f, L->conv, (size_t)c->conv_k * d)) return -1;
+        if (rd_f32s(f, L->wa, (size_t)c->n_heads)) return -1;
+        if (rd_f32s(f, L->wb, (size_t)c->n_heads)) return -1;
+    }
+    if (rd_f32s(f, L->n2, (size_t)d)) return -1;
+    if (rd_f32s(f, L->w1, (size_t)d * dff)) return -1;
+    if (rd_f32s(f, L->w3, (size_t)d * dff)) return -1;
+    if (rd_f32s(f, L->w2, (size_t)dff * d)) return -1;
+    return 0;
+}
+
+static size_t serialized_draft_floats(const spel_cfg *target, int n_layers,
+                                      const int *map) {
+    size_t n = 0;
+    for (int l = 0; l < n_layers; l++) {
+        int src = map[l];
+        int linear = src >= 0 && src < target->n_layers
+                  && target->is_linear[src];
+        n += layer_tensor_count(target, linear);
+    }
+    return n;
+}
+
+static int forward_chunks(spel_model *m, const int32_t *tokens, int n,
+                          float *logits) {
+    int off = 0;
+    while (off < n) {
+        int chunk = m->cfg.spec_k;
+        if (chunk < 1) return -1;
+        if (chunk > n - off) chunk = n - off;
+        spel_forward(m, tokens + off, chunk, logits + (size_t)off * m->cfg.vocab);
+        off += chunk;
+    }
+    return 0;
+}
+
+/* Capture a deterministic SPELV001 footer from a fresh state, then restore
+ * the caller's model state. */
+static int make_golden(spel_model *target, spel_model *draft,
+                       int32_t tokens[SPEL_GOLDEN_LEN],
+                       float **out_t, float **out_d) {
+    *out_t = NULL; *out_d = NULL;
+    if (!target || target->cfg.max_seq < SPEL_GOLDEN_LEN) return -1;
+    int V = target->cfg.vocab;
+    for (int i = 0; i < SPEL_GOLDEN_LEN; i++)
+        tokens[i] = (int32_t)((i * 29 + 7) % V);
+
+    float *tl = (float *)malloc((size_t)SPEL_GOLDEN_LEN * V * sizeof(float));
+    float *dl = draft ? (float *)malloc((size_t)SPEL_GOLDEN_LEN * V * sizeof(float)) : NULL;
+    if (!tl || (draft && !dl)) { free(tl); free(dl); return -1; }
+
+    spel_ckpt *ct = spel_ckpt_new(target);
+    spel_ckpt *cd = draft ? spel_ckpt_new(draft) : NULL;
+    if (!ct || (draft && !cd)) {
+        spel_ckpt_free(ct); spel_ckpt_free(cd);
+        free(tl); free(dl);
+        return -1;
+    }
+    int save_acc = spel_use_accelerate;
+    int cap_t = target->cap_enabled, cap_d = draft ? draft->cap_enabled : 0;
+    target->cap_enabled = 0;
+    if (draft) draft->cap_enabled = 0;
+    spel_use_accelerate = 0;
+    spel_model_reset(target);
+    if (forward_chunks(target, tokens, SPEL_GOLDEN_LEN, tl)) goto fail;
+    if (draft) {
+        spel_model_reset(draft);
+        if (forward_chunks(draft, tokens, SPEL_GOLDEN_LEN, dl)) goto fail;
+    }
+    spel_use_accelerate = save_acc;
+    target->cap_enabled = cap_t;
+    if (draft) draft->cap_enabled = cap_d;
+    if (ct) spel_ckpt_load(target, ct);
+    if (cd) spel_ckpt_load(draft, cd);
+    spel_ckpt_free(ct); spel_ckpt_free(cd);
+    *out_t = tl; *out_d = dl;
+    return 0;
+
+fail:
+    spel_use_accelerate = save_acc;
+    target->cap_enabled = cap_t;
+    if (draft) draft->cap_enabled = cap_d;
+    if (ct) spel_ckpt_load(target, ct);
+    if (cd) spel_ckpt_load(draft, cd);
+    spel_ckpt_free(ct); spel_ckpt_free(cd);
+    free(tl); free(dl);
+    return -1;
+}
+
+static int write_header(FILE *f, const spel_model *target,
+                        const spel_model *draft, uint32_t has_footer) {
+    uint8_t h[64];
+    memset(h, 0, sizeof(h));
+    memcpy(h, SPEL_WEIGHTS_MAGIC, 8);
+    uint32_t vals[13] = {
+        1u,
+        (uint32_t)target->cfg.d_model,
+        (uint32_t)target->cfg.n_layers,
+        (uint32_t)target->cfg.n_heads,
+        (uint32_t)target->cfg.head_dim,
+        (uint32_t)target->cfg.d_ff,
+        (uint32_t)target->cfg.vocab,
+        (uint32_t)target->cfg.attn_period,
+        draft ? (uint32_t)draft->cfg.n_layers : 0u,
+        draft ? (uint32_t)draft->source_map[0] : 0u,
+        draft ? (uint32_t)draft->source_map[1] : 0u,
+        draft ? (uint32_t)draft->source_map[2] : 0u,
+        draft ? (uint32_t)draft->source_map[3] : 0u
+    };
+    for (int i = 0; i < 13; i++)
+        for (int b = 0; b < 4; b++)
+            h[8 + i * 4 + b] = (uint8_t)(vals[i] >> (8 * b));
+    for (int b = 0; b < 4; b++)
+        h[60 + b] = (uint8_t)(has_footer >> (8 * b));
+    return wr_bytes(f, h, sizeof(h));
+}
+
+typedef struct {
+    uint32_t version, d_model, n_layers, n_heads, head_dim, d_ff, vocab;
+    uint32_t attn_period, n_draft_layers, draft_map[4], has_footer;
+} spel_wheader;
+
+static int read_header(FILE *f, spel_wheader *h) {
+    uint8_t b[64];
+    if (rd_bytes(f, b, sizeof(b))) return -1;
+    if (memcmp(b, SPEL_WEIGHTS_MAGIC, 8)) return -1;
+    uint32_t v[13];
+    for (int i = 0; i < 13; i++)
+        v[i] = (uint32_t)b[8 + i * 4] | ((uint32_t)b[9 + i * 4] << 8) |
+               ((uint32_t)b[10 + i * 4] << 16) | ((uint32_t)b[11 + i * 4] << 24);
+    h->version = v[0]; h->d_model = v[1]; h->n_layers = v[2];
+    h->n_heads = v[3]; h->head_dim = v[4]; h->d_ff = v[5];
+    h->vocab = v[6]; h->attn_period = v[7]; h->n_draft_layers = v[8];
+    for (int i = 0; i < 4; i++) h->draft_map[i] = v[9 + i];
+    h->has_footer = (uint32_t)b[60] | ((uint32_t)b[61] << 8) |
+                    ((uint32_t)b[62] << 16) | ((uint32_t)b[63] << 24);
+    if (h->version != 1 || h->n_draft_layers > 4) return -1;
+    for (uint32_t i = 0; i < h->n_draft_layers; i++)
+        if (h->draft_map[i] >= h->n_layers) return -1;
+    return 0;
+}
+
+int spel_save_weights_pair(const spel_model *target, const spel_model *draft,
+                           const char *path) {
+    if (!target || !path) return -1;
+    if (draft && (draft->cfg.n_layers != 4 || draft->n_draft_layers != 4))
+        return -2; /* SPELW001 carries exactly the four distilled layers */
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+
+    int32_t gtokens[SPEL_GOLDEN_LEN];
+    float *gt = NULL, *gd = NULL;
+    int has_golden = make_golden((spel_model *)target, (spel_model *)draft,
+                                 gtokens, &gt, &gd) == 0 && gt;
+    if (write_header(f, target, draft, has_golden ? 1u : 0u)) goto fail;
+
+    const spel_cfg *c = &target->cfg;
+    const int d = c->d_model;
+    if (wr_f32s(f, target->emb, (size_t)c->vocab * d)) goto fail;
+    for (int l = 0; l < c->n_layers; l++)
+        if (save_layer(f, &target->layer[l], c, l)) goto fail;
+    if (wr_f32s(f, target->normf, (size_t)d)) goto fail;
+    if (wr_f32s(f, target->wout, (size_t)c->vocab * d)) goto fail;
+
+    if (draft) {
+        for (int l = 0; l < 4; l++)
+            if (save_layer(f, &draft->layer[l], &draft->cfg, l)) goto fail;
+    }
+
+    if (has_golden) {
+        if (wr_bytes(f, SPEL_GOLDEN_MAGIC, 8)) goto fail;
+        if (wr_u32(f, SPEL_GOLDEN_LEN)) goto fail;
+        for (int i = 0; i < SPEL_GOLDEN_LEN; i++)
+            if (wr_i32(f, gtokens[i])) goto fail;
+        if (wr_f32s(f, gt, (size_t)SPEL_GOLDEN_LEN * c->vocab)) goto fail;
+        if (gd && wr_f32s(f, gd, (size_t)SPEL_GOLDEN_LEN * c->vocab)) goto fail;
+        if (!gd) {
+            float *z = (float *)calloc((size_t)SPEL_GOLDEN_LEN * c->vocab, sizeof(float));
+            int bad = !z || wr_f32s(f, z, (size_t)SPEL_GOLDEN_LEN * c->vocab);
+            free(z);
+            if (bad) goto fail;
+        }
+    }
+
+    free(gt); free(gd);
+    if (fclose(f)) return -1;
+    return 0;
+fail:
+    free(gt); free(gd);
+    fclose(f);
+    return -1;
+}
+
+int spel_save_weights(const spel_model *m, const char *path) {
+    if (!m) return -1;
+    return spel_save_weights_pair(m, m->draft, path);
+}
+
+static int read_footer(FILE *f, spel_model *target, uint32_t has_footer) {
+    free(target->golden_target_logits);
+    free(target->golden_draft_logits);
+    target->golden_target_logits = target->golden_draft_logits = NULL;
+    target->golden_len = 0;
+    if (!has_footer) return 0;
+    char magic[8];
+    uint32_t n = 0;
+    if (rd_bytes(f, magic, 8) || memcmp(magic, SPEL_GOLDEN_MAGIC, 8)) return -1;
+    if (rd_u32(f, &n) || n == 0 || n > SPEL_GOLDEN_LEN) return -1;
+    int32_t toks[SPEL_GOLDEN_LEN];
+    for (uint32_t i = 0; i < n; i++)
+        if (rd_i32(f, &toks[i])) return -1;
+    size_t count = (size_t)n * target->cfg.vocab;
+    float *tl = (float *)malloc(count * sizeof(float));
+    float *dl = (float *)malloc(count * sizeof(float));
+    if (!tl || !dl) { free(tl); free(dl); return -1; }
+    if (rd_f32s(f, tl, count) || rd_f32s(f, dl, count)) {
+        free(tl); free(dl); return -1;
+    }
+    memcpy(target->golden_tokens, toks, (size_t)n * sizeof(int32_t));
+    target->golden_len = (int)n;
+    target->golden_target_logits = tl;
+    target->golden_draft_logits = dl;
+    return 0;
+}
+
+int spel_load_weights_pair(spel_model *target, spel_model *draft,
+                           const char *path) {
+    if (!target || !path) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    spel_wheader h;
+    if (read_header(f, &h)) goto fail;
+    const spel_cfg *c = &target->cfg;
+    if ((int)h.d_model != c->d_model || (int)h.n_layers != c->n_layers ||
+        (int)h.n_heads != c->n_heads || (int)h.head_dim != c->head_dim ||
+        (int)h.d_ff != c->d_ff || (int)h.vocab != c->vocab ||
+        (int)h.attn_period != c->attn_period) goto fail;
+    if (draft) {
+        if ((int)h.n_draft_layers != draft->cfg.n_layers) goto fail;
+        for (int l = 0; l < 4; l++)
+            if ((int)h.draft_map[l] != draft->source_map[l]) goto fail;
+    }
+
+    const int d = c->d_model;
+    if (rd_f32s(f, target->emb, (size_t)c->vocab * d)) goto fail;
+    for (int l = 0; l < c->n_layers; l++)
+        if (load_layer(f, &target->layer[l], c, l)) goto fail;
+    if (rd_f32s(f, target->normf, (size_t)d)) goto fail;
+    if (rd_f32s(f, target->wout, (size_t)c->vocab * d)) goto fail;
+
+    if ((int)h.n_draft_layers > 0) {
+        if (draft) {
+            if (draft->cfg.n_layers != (int)h.n_draft_layers) goto fail;
+            for (int l = 0; l < draft->cfg.n_layers; l++) {
+                if (load_layer(f, &draft->layer[l], &draft->cfg, l)) goto fail;
+                tern_quantize_mat(&draft->layer[l].t1, draft->layer[l].w1);
+                tern_quantize_mat(&draft->layer[l].t3, draft->layer[l].w3);
+                tern_quantize_mat(&draft->layer[l].t2, draft->layer[l].w2);
+                q8_quantize_mat(&draft->layer[l].q_wqkv, draft->layer[l].wqkv);
+                q8_quantize_mat(&draft->layer[l].q_wo, draft->layer[l].wo);
+            }
+        } else {
+            int map[4];
+            for (int i = 0; i < 4; i++) map[i] = (int)h.draft_map[i];
+            size_t skip = serialized_draft_floats(c, (int)h.n_draft_layers, map);
+            if (fseek(f, (long)(skip * sizeof(float)), SEEK_CUR)) goto fail;
+        }
+    }
+
+    if (read_footer(f, target, h.has_footer)) goto fail;
+    fclose(f);
+    spel_model_reset(target);
+    if (draft) spel_model_reset(draft);
+    return 0;
+fail:
+    fclose(f);
+    free(target->golden_target_logits);
+    free(target->golden_draft_logits);
+    target->golden_target_logits = target->golden_draft_logits = NULL;
+    target->golden_len = 0;
+    return -1;
+}
+
+int spel_load_weights(spel_model *m, const char *path) {
+    if (!m) return -1;
+    return spel_load_weights_pair(m, m->draft, path);
+}
+
+int spel_verify_weights(spel_model *target, spel_model *draft, const char *path) {
+    if (!target || !draft) return -1;
+    if (spel_load_weights_pair(target, draft, path)) {
+        printf("  failed to load %s\n", path);
+        return -1;
+    }
+    if (target->golden_len != SPEL_GOLDEN_LEN || !target->golden_target_logits ||
+        !target->golden_draft_logits) {
+        printf("  no SPELV001 golden footer in %s\n", path);
+        return -2;
+    }
+    int V = target->cfg.vocab, n = target->golden_len;
+    float *tl = (float *)malloc((size_t)n * V * sizeof(float));
+    float *dl = (float *)malloc((size_t)n * V * sizeof(float));
+    if (!tl || !dl) { free(tl); free(dl); return -1; }
+    int save_acc = spel_use_accelerate;
+    spel_use_accelerate = 0;
+    spel_model_reset(target);
+    spel_model_reset(draft);
+    int ok = forward_chunks(target, target->golden_tokens, n, tl) == 0 &&
+             forward_chunks(draft, target->golden_tokens, n, dl) == 0;
+    spel_use_accelerate = save_acc;
+    if (!ok) { free(tl); free(dl); return -1; }
+
+    double tmax = 0.0, dmax = 0.0;
+    int targ = 0, darg = 0;
+    for (int i = 0; i < n; i++) {
+        const float *et = target->golden_target_logits + (size_t)i * V;
+        const float *ed = target->golden_draft_logits + (size_t)i * V;
+        const float *at = tl + (size_t)i * V;
+        const float *ad = dl + (size_t)i * V;
+        for (int j = 0; j < V; j++) {
+            double a = fabs((double)at[j] - et[j]);
+            double b = fabs((double)ad[j] - ed[j]);
+            if (a > tmax) tmax = a;
+            if (b > dmax) dmax = b;
+        }
+        if (spel_argmax(at, V) == spel_argmax(et, V)) targ++;
+        if (spel_argmax(ad, V) == spel_argmax(ed, V)) darg++;
+    }
+    printf("  target: max_abs=%.6g  argmax=%d/%d\n", tmax, targ, n);
+    printf("  draft : max_abs=%.6g  argmax=%d/%d\n", dmax, darg, n);
+    free(tl); free(dl);
+    return (targ == n && tmax < 1e-3) ? 0 : 1;
+}
+
+
 /* --------------------------------------------------------- spec decode */
 
 void spel_spec_cfg_default(spel_spec_cfg *s, int K) {
@@ -685,6 +1126,7 @@ void spel_spec_cfg_default(spel_spec_cfg *s, int K) {
     s->governor = 1;
     s->alpha_threshold = 0.30;
     s->window = 2;
+    s->force_alpha = -1.0; /* real verification by default */
 }
 
 void spel_spec_generate(spel_model *target, spel_model *draft,
@@ -726,6 +1168,7 @@ void spel_spec_generate(spel_model *target, spel_model *draft,
     int fallback = 0;
     int pending = -1;     /* emitted correction, not yet consumed by the models */
     int emitted = 0;
+    double force_credit = 0.0; /* fractional forced-acceptance carry */
 
     while (emitted < n_gen) {
         if (fallback) {
@@ -768,14 +1211,30 @@ void spel_spec_generate(spel_model *target, spel_model *draft,
             for (int j = 0; j < K; j++) toks[j + 1] = prop[j];
             spel_forward(target, toks, K + 1, tlog);
             while (m < K && spel_argmax(tlog + (size_t)m * V, V) == prop[m]) m++;
-            corr = spel_argmax(tlog + (size_t)m * V, V);
-            target->pos = base + 1 + m;
-            draft->pos  = base + 1 + m;
         } else {
             memcpy(tlog, saved, (size_t)V * sizeof(float));
             spel_forward(target, prop, K, tlog + V);
             while (m < K && spel_argmax(tlog + (size_t)m * V, V) == prop[m]) m++;
-            corr = spel_argmax(tlog + (size_t)m * V, V);
+        }
+
+        /* Benchmark-only forced acceptance. Both model forwards above have
+         * already run, including all K proposal draft steps and the pending
+         * correction step, so the measured cost includes the real draft and
+         * verification work. Only the accepted-prefix decision is synthetic. */
+        if (sc->force_alpha >= 0.0) {
+            force_credit += sc->force_alpha * (double)K;
+            int forced = (int)force_credit;
+            if (forced < 0) forced = 0;
+            if (forced > K) forced = K;
+            force_credit -= (double)forced;
+            m = forced;
+        }
+
+        corr = spel_argmax(tlog + (size_t)m * V, V);
+        if (has_pending) {
+            target->pos = base + 1 + m;
+            draft->pos  = base + 1 + m;
+        } else {
             target->pos = base + m;
             draft->pos  = base + m;
         }
