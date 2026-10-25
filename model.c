@@ -979,7 +979,19 @@ fail:
 
 int spel_save_weights(const spel_model *m, const char *path) {
     if (!m) return -1;
-    return spel_save_weights_pair(m, m->draft, path);
+    if (m->draft) return spel_save_weights_pair(m, m->draft, path);
+    /* Default 12-layer targets get the conventional [0,3,6,9] cheap draft,
+     * copied from the target and quantized on load. Callers that have a
+     * distilled draft should attach it or use spel_save_weights_pair. */
+    if (m->cfg.n_layers >= 10) {
+        int map[4] = {0, 3, 6, 9};
+        spel_model *tmp = spel_model_new_draft_subset(m, map, 4);
+        if (!tmp) return -1;
+        int r = spel_save_weights_pair(m, tmp, path);
+        spel_model_free(tmp);
+        return r;
+    }
+    return spel_save_weights_pair(m, NULL, path);
 }
 
 static int read_footer(FILE *f, spel_model *target, uint32_t has_footer) {

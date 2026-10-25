@@ -82,7 +82,10 @@ distilled FP32 parameters for layers `[0, 3, 6, 9]`; it shares the token
 embedding, final RMSNorm and LM head with the target. On load, C quantizes each
 draft `wqkv`/`wo` with its existing q8 quantizer and `w1`/`w3`/`w2` with the
 existing 3-step ternary least-squares quantizer. The file keeps FP32 latents,
-so QAT export is lossless with respect to the C quantizers.
+so QAT export is lossless with respect to the C quantizers. `spel_save_weights`
+writes an attached distilled draft, or (for a 12-layer target with no attached
+draft) a conventional `[0,3,6,9]` copy; `spel_save_weights_pair` is the explicit
+distilled-draft path.
 
 An optional `SPELV001` footer follows the weights:
 
