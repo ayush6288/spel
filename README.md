@@ -7,9 +7,9 @@ SPEL investigates two core bottlenecks in edge inference:
 1. **DRAM-resident autoregressive decode**, where each token streams the target weights and memory bandwidth is a candidate limiter. SPEL addresses this with 2-bit ternary draft proposals, a persistent draft-only thread pool, and O(1) transactional rollback.
 2. **Context-memory growth in recurrent/attention hybrids**, addressed with chunked key-distinctiveness indexing, compact BF16 addresses, branch-isolated state snapshots, and replay scheduling.
 
-> **Artifact status.** This is a research harness, not a model release. The 21.35M-parameter checkpoint is trained but is not committed (`weights/` is gitignored). The 218.44M-parameter checkpoint is a **C-generated random model** used only to validate the scaled runtime and measure DRAM-resident systems behavior; it has no language quality or learned acceptance. Forced-acceptance rows are benchmark-only system ceilings, not decoding results. Raw measurement captures are in [`results/`](results/).
+> **Artifact status.** This is a research harness, not a model release. The 21.35M-parameter checkpoint is trained but is not committed (`weights/` is gitignored). The 218.44M-parameter checkpoint is a **C-generated random model** used only to validate the scaled runtime and measure DRAM-resident systems behavior; it has no language quality or learned acceptance. Forced-acceptance rows are benchmark-only system ceilings, not decoding results. Raw K=16 measurement captures are in [`results/`](results/). The K=4 in-domain result in §2.2.1 was measured with a temporary training-like prompt harness and is reported separately from the pinned capture set.
 
-**Measured code revisions:** `36a158e` (Phase 2: persistent draft pool, 21M steady-state decode, and NoteBank demo) and `cceae5b` (Phase 3: runtime configuration, 21M re-verification, scaled synthetic generation/verification, and final self-test). All measured numbers below are transcribed from the captures in `results/`; derived quantities are identified explicitly.
+**Measured code revisions:** `36a158e` (Phase 2: persistent draft pool, 21M steady-state decode, and NoteBank demo) and `cceae5b` (Phase 3: runtime configuration, 21M re-verification, scaled synthetic generation/verification, and final self-test). The K=4 in-domain evaluation was run on `acd777e` with the temporary in-domain prompt harness; the K=4 runtime default is adopted in this revision. Historical K=16 numbers are transcribed from the captures in `results/`; derived quantities are identified explicitly.
 
 ---
 
@@ -82,7 +82,7 @@ Self-test `[8]` compares all `16 x 128` draft logits at 1 and 4 workers: **0 dif
 
 Hardware: Apple M5 MacBook Air, 10 cores (4 performance + 6 efficiency), 16 GB unified memory, macOS. Build: `clang -O3 -mcpu=apple-m5 -ffast-math -std=gnu11 -Wall -Wextra -pthread`; links `-lm -framework Accelerate`.
 
-- Decode benchmark: 64-token prompt, 8 warm tokens, 64 generated tokens, K=16 unless stated. Target AR is the baseline.
+- Decode benchmark: 64-token prompt, 8 warm tokens, 64 generated tokens. The historical captures below use K=16; the runtime default is now K=4. Target AR is the baseline. The in-domain K=4 evaluation in §2.2.1 uses a 379-token training-like prompt, 0 warm tokens, and 64 generated tokens.
 - Headline decode ranges span three steady-state process runs per regime: `phase2_bench2–4` for 21M and `phase3_scaled_bench1–3` for 218M. B1 is repeated inside every bench capture; its tabled range spans the captures in `results/`. B2/B3 verification-cost ranges use the same three steady-state runs. Forced-acceptance rows are the median of three internal repetitions per process run.
 - `c` is draft time divided by AR target time. `v` is one `K+1` target verification divided by one AR token. These are system ratios, not FLOP-normalized efficiencies.
 - Derived rates use verifier parameter counts and measured tok/s: one MAC per target parameter per token, and one FP32 target-weight read per token. The derivation is in [`results/derived_rates.txt`](results/derived_rates.txt).
@@ -101,6 +101,8 @@ Raw captures:
 | 218M decode runs | [`results/phase3_scaled_bench1.log`](results/phase3_scaled_bench1.log), [`results/phase3_scaled_bench2.log`](results/phase3_scaled_bench2.log), [`results/phase3_scaled_bench3.log`](results/phase3_scaled_bench3.log) |
 | NoteBank demo with trained checkpoint | [`results/phase2_demo.log`](results/phase2_demo.log) |
 | derived rates | [`results/derived_rates.txt`](results/derived_rates.txt) |
+
+The K=4 in-domain result in §2.2.1 is a separate temporary-harness measurement; the table above remains the pinned K=16 capture set.
 
 ### 2.2 Regime A: 21M Cache-Resident Model (Trained Checkpoint)
 
@@ -148,7 +150,7 @@ The 1-to-4-worker steady-state speedup is **1.47–1.55x**. One early 4-thread r
 | governed | 1 | 16 | 341.5–344.0 | 0.92–0.94x | alpha=0.094; 1 trip; 59 AR rounds |
 | governed | 4 | 16 | 356.2–361.0 | 0.96–0.97x | alpha=0.094; 1 trip; 59 AR rounds |
 
-Raw speculation **loses** on this checkpoint. The governor trips early (one trip) and falls back to AR, reaching **0.96–0.97x** AR at 4 threads. It is a safety mechanism that recovers near-baseline speed; it is not a real speedup.
+Raw speculation **loses on the original random-token prompt at K=16**. The governor trips early (one trip) and falls back to AR, reaching **0.96–0.97x** AR at 4 threads. It is a safety mechanism that recovers near-baseline speed; it is not a real speedup.
 
 **Forced-acceptance system ceilings.** These rows are benchmark-only: the draft and target forwards execute for real, but the accepted prefix is forced after the fact. They are not decoding quality.
 
@@ -158,7 +160,25 @@ Raw speculation **loses** on this checkpoint. The governor trips early (one trip
 | oracle-4L | 1 | 16 | 1274.5–1290.8 | 3.45–3.52x | 1.000 |
 | oracle-12L full copy | 1 | 16 | 302.4–311.0 | 0.82–0.85x | 1.000 |
 
-The full-copy oracle remains below AR even at 100% acceptance: a target-sized draft pays roughly one full target forward per proposal. The cheap-draft ceiling is real only under forced acceptance; real raw acceptance on this checkpoint is 0.052.
+The full-copy oracle remains below AR even at 100% acceptance: a target-sized draft pays roughly one full target forward per proposal. The cheap-draft ceiling is real only under forced acceptance; real raw acceptance on the original random-token prompt is 0.052. The in-domain K=4 regime is reported separately below.
+
+#### 2.2.1 In-Domain Evaluated Regime (K=4)
+
+The original benchmark prompt is random token IDs, whereas the trained checkpoint was trained on NoteBank sequences. To test the native distribution, a temporary 379-token prompt was constructed with three copies of `KEY_15=1907;` at offsets 30, 158, and 286, training-word filler, and a final `?KEY_15=` query. The answer was omitted so the decoder had to emit it; the target produced `1907.` correctly in every run. Warm-up was disabled so the eight warm tokens would not consume the query answer.
+
+Three process runs with `SPEL_SPEC_K=4 SPEL_DRAFT_THREADS=4`:
+
+| path | threads | K | tok/s | vs AR | acceptance |
+|---|---:|---:|---:|---:|---|
+| AR target | — | — | 340.9–345.2 | 1.00x | — |
+| raw | 1 | 4 | 423.0–425.9 | 1.23–1.25x | alpha=0.618; 47/76 proposals |
+| raw | 4 | 4 | 502.1–505.5 | 1.45–1.48x | alpha=0.618; 47/76 proposals |
+| governed | 1 | 4 | 364.7–369.2 | 1.06–1.07x | alpha=0.594; 1 trip; 37 AR rounds |
+| governed | 4 | 4 | 394.6–399.9 | 1.16x | alpha=0.594; 1 trip; 37 AR rounds |
+
+Verification falls to **`v=1.98–2.02x` AR token** for the `K+1=5` batch; draft cost is `c=0.31–0.32x` at 1 thread and `0.14x` at 4 threads. The raw path averaged 19 rounds and 3.37 tokens/round. The 4-thread raw result is a real, unforced net speedup of **1.45–1.48x AR**; the 1-thread raw path reaches **1.23–1.25x**. The governed path trips once and spends 37 rounds in AR fallback, so its 1.16x is not pure speculative speedup.
+
+K=4 is now the runtime default (`SPEL_DEFAULT_SPEC_K`). The historical K=16 random-prompt result remains `alpha=0.052` and `0.38–0.46x` raw; the in-domain result is not directly comparable because the prompt distribution and context length (379 versus 64) differ. Only the first five generated tokens are the needle answer, so the 64-token aggregate alpha is diluted; this is a trained-distribution probe, not a general language-quality claim.
 
 ### 2.3 Regime B: 218M DRAM-Resident Model (Systems Scaling)
 
@@ -231,7 +251,7 @@ The forced ceiling rises with scale, but the real rows do not. The 218M experime
 | draft t1 / t4 | 2973.8–2981.9 / 4394.7–4627.6 | 333.3–354.0 / 734.0–1000.2 |
 | c t1 / t4 | 0.12 / 0.08 | 0.08–0.09 / 0.03–0.04 |
 | v at M=17 fast (B2) | 2.69–2.74 | 1.52–1.62 |
-| raw alpha | 0.052 | 0.000 (random) |
+| raw alpha (K=16 random prompt) | 0.052 | 0.000 (random) |
 | governed | 0.92–0.97x AR | 0.96–0.98x AR |
 | forced 0.75 | 2.75–2.78x | 4.39–4.50x |
 | forced 1.00 | 3.45–3.52x | 5.50–5.61x |
@@ -286,7 +306,7 @@ The demo's NoteBank-to-spec run on the trained checkpoint produced alpha=0.000, 
 |---|---|
 | `[1]` ternary pack/dot/GEMV | dotprod, addsub, scalar agree; GEMV matches dequantized reference |
 | `[2]` batched vs sequential | 256 logits, **0 differ** |
-| `[3]` speculative fidelity | plain 40/40; governed 32/32; K=16 32/32; K=16 governed 32/32 |
+| `[3]` speculative fidelity | K=4 plain 40/40; K=4 governed 32/32; K=16 32/32; K=16 governed 32/32 |
 | `[4]` NoteBank | needles 3/3; similarity recall 3/3; votes 2/3; toy storage 6,720 B |
 | `[5]` fast path | strict AR vs fast spec 24/24 tokens; 248/256 logit bits differ; argmax differs 0/4 |
 | `[6]` forced acceptance | 30/40 at 0.75; 32/32 at 1.00; emitted 32/32; target/draft positions aligned |
@@ -299,9 +319,9 @@ Strict mode is the only bit-exact path. Fast mode is token-equivalent on the tes
 
 ## 3. Drawbacks, Limitations & Negative Results
 
-1. **The acceptance-rate gap is the dominant negative result.** The trained checkpoint reaches raw alpha **0.052** (29 accepted of 560 proposals) and governed alpha **0.094** on the benchmark prompt. Raw decoding runs at **0.38–0.46x AR**; the governor recovers **0.92–0.97x AR** by abandoning speculation. The repository contains no training log or sidecar metrics, so no KL-divergence reduction is reported. A claimed 98% KL reduction cannot be substantiated from this artifact and is omitted.
+1. **The random-prompt acceptance-rate gap remains the dominant negative result.** On the original random-token benchmark prompt at K=16, the trained checkpoint reaches raw alpha **0.052** (29 accepted of 560 proposals) and governed alpha **0.094**. Raw decoding runs at **0.38–0.46x AR**; the governor recovers **0.92–0.97x AR** by abandoning speculation. The in-domain K=4 regime in §2.2.1 raises alpha to **0.618** and raw 4-thread throughput to **1.45–1.48x AR**, but that prompt is synthetically matched to the training distribution and only the first five generated tokens are the needle answer. It does not establish general language quality or broad acceptance. The repository contains no training log or sidecar metrics, so no KL-divergence reduction is reported. A claimed 98% KL reduction cannot be substantiated from this artifact and is omitted.
 
-2. **Small-model speculation is not a speedup.** The 21M target already runs at 366.5–371.0 tok/s, and its measured MAC rate is consistent with compute-bound execution. Its raw speculation loses, and its governed path is approximately parity. The 2.75–3.52x figures are forced-acceptance system ceilings. Real decoding on this checkpoint does not approach them.
+2. **Small-model speculation is not a general speedup.** The 21M target already runs at 366.5–371.0 tok/s, and its measured MAC rate is consistent with compute-bound execution. On the original random-token prompt at K=16, raw speculation loses and the governed path is approximately parity. On the training-like in-domain prompt at K=4, raw 4-thread decoding reaches **1.45–1.48x AR** and 1-thread reaches **1.23–1.25x**. The 2.75–3.52x figures remain forced-acceptance system ceilings; general-purpose decoding on this checkpoint does not approach them.
 
 3. **DRAM residency is verified; bandwidth saturation is not.** The 218M target is 833.27 MiB and streams 52 MiB per layer, so it is DRAM-resident. However, its measured 6.44–6.53 GMAC/s is within the FP32 NEON kernel range, and its effective 24.0–24.3 GiB/s weight rate is lower than the 21M rate. The experiment does not establish a bandwidth-saturation ceiling. The forced 4.39–5.61x rows are systems ceilings with synthetic weights; the real rows are 0.34–0.50x raw and 0.96–0.98x governed.
 
@@ -333,9 +353,10 @@ make selftest        # 8 invariant suites; must print PASS (0 failures)
 make bench           # kernels + strict/fast verification + decode + rollback
 make demo            # NoteBank branch -> retrieve -> replay -> spec demo
 
-# Compare speculative depth on the same machine:
+# K=4 is the default. Compare speculative depth on the same machine:
+./spel bench                  # default K=4
 SPEL_BENCH_K=8  ./spel bench
-SPEL_BENCH_K=16 ./spel bench
+SPEL_BENCH_K=16 ./spel bench  # historical K=16 comparison
 ```
 
 `make selftest` is self-contained. The decode numbers in §2 require the local trained 21M checkpoint at `weights/spel.bin`; without it, `bench` runs a randomly initialized model. `demo` uses the checkpoint for the NoteBank path when it is present and falls back to the toy configuration otherwise. The 48-token spec run is always a freshly initialized model and is a plumbing check.
@@ -350,7 +371,7 @@ make clean && make ARCH="-march=native"
 
 ### 4.2 Runtime configuration
 
-The default shape is `d_model=384, n_layers=12, n_heads=6, head_dim=64, d_ff=1024, vocab=128`. The scaled shape is `d_model=1024, n_layers=16, n_heads=16, head_dim=64, d_ff=3072`.
+The default shape is `d_model=384, n_layers=12, n_heads=6, head_dim=64, d_ff=1024, vocab=128`. The scaled shape is `d_model=1024, n_layers=16, n_heads=16, head_dim=64, d_ff=3072`. The default speculative depth is **K=4** (`SPEL_DEFAULT_SPEC_K`); `SPEL_SPEC_K` or `SPEL_BENCH_K` overrides it.
 
 CLI:
 

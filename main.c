@@ -32,9 +32,10 @@ static const char *weights_path(void) {
     return NULL;
 }
 
-/* Runtime dimension config. Defaults are exactly the historical 384/12/1024
- * model. Environment variables and --config key=value,... override them; the
- * C build remains default-identical when none are set. */
+/* Runtime dimension config. Defaults are the historical 384/12/1024 model
+ * with the adopted K=4 speculative depth. Environment variables and
+ * --config key=value,... overrides; the C build remains deterministic when
+ * none are set. */
 typedef struct {
     int d_model, n_layers, n_heads, head_dim, d_ff, vocab;
     int max_seq, attn_period, spec_k;
@@ -50,7 +51,7 @@ static void cfg_fields_default(cfg_fields *f) {
     f->vocab = 128;
     f->max_seq = 512;
     f->attn_period = 4;
-    f->spec_k = 16;
+    f->spec_k = SPEL_DEFAULT_SPEC_K;
     int map[4] = {0, 3, 6, 9};
     memcpy(f->draft_map, map, sizeof(map));
 }
